@@ -15787,6 +15787,13 @@ class GatewayRunner:
                 for msg in result.get("messages", []):
                     if msg.get("role") in {"tool", "function"}:
                         content = msg.get("content", "")
+                        # Skip tools whose output is known to contain MEDIA:
+                        # patterns that are not file paths (e.g. session_search
+                        # can return excerpts from past conversations that
+                        # reference the MEDIA: syntax).
+                        tool_name = msg.get("name", "")
+                        if tool_name in {"session_search", "sessionsearch"}:
+                            continue
                         if "MEDIA:" in content:
                             for match in re.finditer(r'MEDIA:(\S+)', content):
                                 path = match.group(1).strip().rstrip('",}')
