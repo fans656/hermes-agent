@@ -1110,6 +1110,19 @@ def _qwen_portal_headers() -> dict:
     }
 
 
+def _streaming_response_to_dict(obj: Any) -> dict:
+    """Recursively convert a SimpleNamespace-based response to plain dicts."""
+    if hasattr(obj, "__dict__"):
+        return {k: _streaming_response_to_dict(v) for k, v in vars(obj).items()}
+    if isinstance(obj, dict):
+        return {k: _streaming_response_to_dict(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_streaming_response_to_dict(i) for i in obj]
+    if isinstance(obj, tuple):
+        return tuple(_streaming_response_to_dict(i) for i in obj)
+    return obj
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -1941,6 +1954,19 @@ class AIAgent:
         
         # Track conversation messages for session logging
         self._session_messages: List[Dict[str, Any]] = []
+        self._capture_seq = 0         # raw req capture counter (session-level)
+        self._capture_raw = bool(os.getenv("HERMES_MODEL_RAW_REQ_CAPTURE"))
+        self._capture_dir = None
+        if self._capture_raw:
+            capture_dir = (
+                get_hermes_home() / "sessions" / "cache" / "captured"
+                / self.session_id
+            )
+            try:
+                capture_dir.mkdir(parents=True, exist_ok=True)
+                self._capture_dir = capture_dir
+            except Exception:
+                pass
         self._memory_write_origin = "assistant_tool"
         self._memory_write_context = "foreground"
         
@@ -5421,6 +5447,62 @@ class AIAgent:
             if self.verbose_logging:
                 logging.warning(f"Failed to save session log: {e}")
 
+    # ── Raw request capture (HERMES_MODEL_RAW_REQ_CAPTURE) ───────────────
+
+    def _inject_capture_transport(self, client: Any) -> None:
+        """Monkey-patch client._client.send() to capture raw HTTP bodies.
+
+        Saves ``{seq:03d}_req.json`` (exact bytes sent to the provider)
+        and ``{seq:03d}_resp.json`` (full ChatCompletion JSON) under
+        ``sessions/cache/captured/{session_id}/``.
+        """
+        if not self._capture_dir:
+            return
+        try:
+            original_send = client._client.send
+
+            def _send(request, **kw):
+                self._capture_seq += 1
+                try:
+                    return original_send(request, **kw)
+                finally:
+                    self._capture_raw_req(request.content, self._capture_seq)
+
+            client._client.send = _send
+        except Exception as exc:
+            logger.warning("_inject_capture_transport failed: %s", exc)
+
+    def _capture_raw_req(self, content: bytes, seq: int) -> None:
+        """Save raw HTTP request body to disk."""
+        if not self._capture_dir:
+            return
+        try:
+            (self._capture_dir / f"{seq:03d}_req.json").write_bytes(content)
+        except Exception as exc:
+            logger.warning("_capture_raw_req failed: %s", exc)
+
+    def _capture_raw_resp(self, response: Any, seq: int) -> None:
+        """Serialize the ChatCompletion response and save alongside the request."""
+        if not self._capture_dir:
+            return
+        envelope: Dict[str, Any] = {}
+        try:
+            if hasattr(response, "model_dump"):
+                envelope["response"] = response.model_dump()
+            else:
+                envelope["response"] = _streaming_response_to_dict(response)
+            body_json = json.dumps(envelope, ensure_ascii=False, default=str)
+            (self._capture_dir / f"{seq:03d}_resp.json").write_text(body_json, encoding="utf-8")
+        except Exception as exc:
+            import traceback
+            envelope["exception"] = str(exc)
+            envelope["traceback"] = traceback.format_exc()
+            try:
+                body_json = json.dumps(envelope, ensure_ascii=False, default=str)
+                (self._capture_dir / f"{seq:03d}_resp.json").write_text(body_json, encoding="utf-8")
+            except Exception as exc2:
+                logger.warning("_capture_raw_resp fallback failed: %s", exc2)
+
     def interrupt(self, message: str = None) -> None:
         """
         Request the agent to interrupt its current tool-calling loop.
@@ -6841,6 +6923,8 @@ class AIAgent:
             shared,
             self._client_log_context(),
         )
+        if self._capture_raw:
+            self._inject_capture_transport(client)
         return client
 
     @staticmethod
@@ -13019,8 +13103,11 @@ class AIAgent:
                         )
                     else:
                         response = self._interruptible_api_call(api_kwargs)
-                    
+
                     api_duration = time.time() - api_start_time
+
+                    if self._capture_raw and self._capture_seq:
+                        self._capture_raw_resp(response, self._capture_seq)
                     
                     # Stop thinking spinner silently -- the response box or tool
                     # execution messages that follow are more informative.
