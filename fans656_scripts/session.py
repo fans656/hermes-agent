@@ -147,6 +147,24 @@ def _get_max_msg_id_raw(session_id: str) -> int:
         print(f"session: _get_max_msg_id_raw({session_id}) failed: {exc}",
               file=sys.stderr)
     return 0
+
+
+def _get_preview(session_id: str) -> str:
+    try:
+        conn = _connect()
+        row = conn.execute(
+            "SELECT substr(content, 1, 80) as preview FROM messages "
+            "WHERE session_id = ? AND role = 'user' "
+            "ORDER BY id ASC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        conn.close()
+        if row:
+            return row["preview"] or ""
+    except Exception as exc:
+        print(f"session: _get_preview({session_id}) failed: {exc}",
+              file=sys.stderr)
+    return ""
     try:
         conn = _connect()
         row = conn.execute(
