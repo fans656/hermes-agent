@@ -1,0 +1,799 @@
+#!/usr/bin/env python3
+"""Diary tools — probe conversations and write diary entries.
+
+Subcommands::
+
+    diary.py write [-n N] [--dryrun] [--verbose] [--force] [<sid>]
+    diary.py fix
+    diary.py status
+    diary.py clear
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# ── Paths ───────────────────────────────────────────────────────────────
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+_HERMES_HOME = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes")))
+# _SCRIPTS_DIR is unreliable when run via os.execv from cron wrapper;
+# use an absolute path derived from HERMES_HOME.
+_FANS656_SCRIPTS = _HERMES_HOME / "hermes-agent" / "fans656_scripts"
+_STATE_FILE = _HERMES_HOME / "cron" / "proactive_diary" / "tmp" / "state.json"
+_DIARY_PATH = _HERMES_HOME / "workspace" / "evo-diary.md"
+
+STATE_PRUNE_DAYS = 7
+MAX_RUNS_PER_SESSION = 3
+_MSG_DT_FMT = "%Y-%m-%d %H:%M:%S"
+_COOLDOWN_HOURS = int(os.getenv("PROACTIVE_DIARY_COOLDOWN_HOURS", "2"))
+_QUIET_SECONDS = int(os.getenv("PROACTIVE_DIARY_QUIET_SECONDS", "300"))
+
+PROBE_TEXT = (
+    "你意识的表层完成了对话。潜意识在后台扫了一遍刚才这些交流——"
+    "注意你看不到自己最后一条回复，它不在下面的上下文里。"
+    "请基于对话历史和你当前的心境，判断有没有什么值得写进日记的。"
+    "只回复 YES 或 NO，不要展开。如果你回答 YES，我会再给你一次完整上下文让你实际写。"
+)
+
+# ── Logging ─────────────────────────────────────────────────────────────
+
+_VERBOSE = bool(os.getenv("PROACTIVE_DIARY_DEBUG"))
+
+
+def _log(msg: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"  [diary] [{ts}] {msg}")
+
+
+# ── Subprocess helpers ─────────────────────────────────────────────────
+
+def _run_session_json(*args: str) -> Any:
+    """Run session.py and return parsed JSON output."""
+    cmd = [sys.executable, str(_FANS656_SCRIPTS / "session.py"), *args, "--json"]
+    if _VERBOSE:
+        _log(f"[CALL] session {' '.join(args)}")
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    if r.returncode != 0:
+        _log(f"[ERR] session {r.stderr[:200]}")
+        return None
+    return json.loads(r.stdout) if r.stdout.strip() else None
+
+
+def _run_fork_json(*args: str) -> tuple:
+    """Run fork.py --send and return (parsed_json_or_None, error_dict_or_None)."""
+    cmd = [sys.executable, str(_FANS656_SCRIPTS / "fork.py"), *args, "--send"]
+    if _VERBOSE:
+        _log(f"[CALL] fork {' '.join(args)}")
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        error = {
+            "rc": r.returncode,
+            "stderr": r.stderr or "",
+            "stdout": r.stdout or "",
+        }
+        _log(f"[ERR] fork (rc={r.returncode}): {(r.stderr or '')[:300]}")
+        return None, error
+    try:
+        if not r.stdout.strip():
+            return None, {
+                "rc": r.returncode,
+                "error": "empty stdout",
+                "stderr": r.stderr or "",
+                "cmd": " ".join(args)[:200],
+            }
+        return json.loads(r.stdout), None
+    except json.JSONDecodeError:
+        return None, {"rc": r.returncode, "error": "JSON parse failed", "stdout": r.stdout or ""}
+
+
+# ── DB helpers ──────────────────────────────────────────────────────────
+
+# ── State ───────────────────────────────────────────────────────────────
+
+def _read_state() -> Dict[str, Any]:
+    if _STATE_FILE.exists():
+        try:
+            return json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _write_state(state: Dict[str, Any]) -> None:
+    _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+
+
+def _prune_state(state: Dict[str, Any]) -> None:
+    cutoff = time.time() - (STATE_PRUNE_DAYS * 86400)
+    stale = [sid for sid, v in state.items()
+             if isinstance(v, dict) and v.get("last_probed_at", 0) < cutoff]
+    for sid in stale:
+        del state[sid]
+    if stale:
+        _log(f"pruned {len(stale)} stale state entries")
+
+
+def _record_run(state: Dict[str, Any], sid: str, run_data: Dict[str, Any]) -> None:
+    entry = state.setdefault(sid, {})
+    runs: list = entry.setdefault("runs", [])
+    runs.insert(0, run_data)
+    if len(runs) > MAX_RUNS_PER_SESSION:
+        runs.pop()
+    entry["last_probed_at"] = run_data.get("at", time.time())
+    if run_data.get("diary_written"):
+        entry["last_written_at"] = run_data["at"]
+
+
+def _humanize_gap(seconds: float) -> str:
+    """Return a human-friendly gap string like '3h before' or '5m after'."""
+    if seconds == 0:
+        return "0s"
+    direction = "before" if seconds < 0 else "after"
+    delta = abs(seconds)
+    if delta < 60:
+        return f"{int(delta)}s {direction}"
+    if delta < 3600:
+        return f"{int(delta / 60)}m {direction}"
+    if delta < 86400:
+        return f"{delta / 3600:.1f}h {direction}"
+    return f"{delta / 86400:.1f}d {direction}"
+
+
+# ── Diary parsing ────────────────────────────────────────────────────────
+
+@dataclass
+class DiaryEntry:
+    dt: datetime
+    text: str = ""           # full content after the ## heading
+    has_meta: bool = False   # has proactive-diary yaml block
+    session: str = ""        # session id from meta
+    beg: str = ""            # session start from meta
+    end: str = ""            # session end from meta
+
+    @property
+    def preview(self) -> str:
+        return self.text.replace("\n", " ")[:80]
+
+
+def _parse_all_diary_entries() -> List[DiaryEntry]:
+    """Parse all ``## <datetime>`` entries from the diary file.
+
+    Returns entries sorted by datetime ascending.
+    """
+    result: List[DiaryEntry] = []
+    if not _DIARY_PATH.exists():
+        return result
+
+    try:
+        text = _DIARY_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return result
+
+    pattern = r"^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\n(.*?)(?=\n## |\Z)"
+    for m in re.finditer(pattern, text, re.DOTALL | re.MULTILINE):
+        dt_str = m.group(1)
+        body = m.group(2).strip()
+        try:
+            dt = datetime.strptime(dt_str, _MSG_DT_FMT)
+        except ValueError:
+            continue
+
+        entry = DiaryEntry(dt=dt, text=body)
+
+        # Check for proactive-diary yaml block
+        yaml_match = re.search(r"```yaml proactive-diary\n(.*?)```", body, re.DOTALL)
+        if yaml_match:
+            entry.has_meta = True
+            meta = _parse_entry_meta(yaml_match.group(1))
+            entry.session = meta.get("session", "")
+            entry.beg = meta.get("beg", "")
+            entry.end = meta.get("end", "")
+
+        result.append(entry)
+
+    result.sort(key=lambda e: e.dt)
+    return result
+
+
+def _parse_entry_meta(yaml_text: str) -> Dict[str, str]:
+    """Parse simple key: value pairs from a yaml block."""
+    meta: Dict[str, str] = {}
+    for line in yaml_text.split("\n"):
+        line = line.strip()
+        if ":" in line:
+            key, _, val = line.partition(":")
+            meta[key.strip()] = val.strip()
+    return meta
+
+
+def _find_nearest_entries(
+    session_ts: float,
+    entries: List[DiaryEntry],
+) -> tuple[Optional[DiaryEntry], Optional[DiaryEntry]]:
+    """Return (prev, next) diary entries nearest to *session_ts* (unix time).
+
+    *prev* is the latest entry before *session_ts*, *next* is the earliest
+    entry after it.  Either may be None.
+    """
+    session_dt = datetime.fromtimestamp(session_ts)
+    prev: Optional[DiaryEntry] = None
+    nxt: Optional[DiaryEntry] = None
+    for e in entries:
+        if e.dt < session_dt:
+            prev = e
+        elif e.dt > session_dt and nxt is None:
+            nxt = e
+            break
+    return prev, nxt
+
+
+def _diary_cooldown_active(
+    sid: str,
+    entries: List[DiaryEntry],
+) -> bool:
+    """Check if this session already has a recent diary entry."""
+    for e in reversed(entries):  # newest first
+        if e.has_meta and e.session == sid:
+            try:
+                if (datetime.now() - e.dt).total_seconds() < _COOLDOWN_HOURS * 3600:
+                    return True
+            except Exception:
+                pass
+            break
+    return False
+
+
+def _build_write_prompt(diary_entries: List[DiaryEntry],
+                         session_beg: str = "", session_end: str = "",
+                         probe_content: str = "") -> str:
+    base = (
+        "你现在是Evo的潜意识，决定写一篇日记。"
+        "可长可短，可以分段。"
+        "不要加标题、时间戳。中文。直接写内容。"
+        "你也可以回复 NO 选择不写。"
+    )
+
+    # If probe response included diary content beyond YES, feed it in
+    if probe_content:
+        probe_body = probe_content.strip()
+        # Strip leading YES/NO + possible markdown bold
+        import re as _re
+        probe_body = _re.sub(r'^\**\s*(YES|NO)\**[\s,.:;!！，。：；]*', '', probe_body, flags=_re.IGNORECASE).strip()
+        if probe_body:
+            base += (
+                f"\n\n刚才在快速扫描时你已经写了一些内容：\n\n{probe_body}\n\n"
+                f"注意——快速扫描时你看不到自己最后一条回复。"
+                f"现在你可以看到完整对话了。"
+                f"你可以直接沿用刚才的内容、在它基础上补充、或者重写一篇。"
+            )
+
+    # Filter to entries near this session (within ~6h of session start)
+    nearby: List[DiaryEntry] = []
+    for e in diary_entries:
+        if not e.text:
+            continue
+        if not session_beg:
+            nearby.append(e)
+            continue
+        try:
+            sess_dt = datetime.strptime(session_beg, _MSG_DT_FMT)
+            if abs((e.dt - sess_dt).total_seconds()) < 6 * 3600:
+                nearby.append(e)
+        except ValueError:
+            pass
+
+    if nearby:
+        all_text = "\n\n---\n\n".join(e.text for e in nearby)
+        return (
+            f"{base}\n"
+            f"你之前已写过如下内容的日记：\n\n{all_text}\n\n"
+            f"只需补充之后的新内容。如果没什么新东西可写，回复 NO。"
+        )
+    return base
+
+
+# ── Probe / Write ───────────────────────────────────────────────────────
+
+def _parse_yes_no(content: str) -> Optional[bool]:
+    # Strip markdown bold, then check
+    cleaned = content.strip().replace("**", "").replace("*", "")
+    if not cleaned:
+        _log(f"probe response is empty after stripping")
+        return None
+    upper = cleaned.upper()
+
+    if upper.startswith("YES"):
+        return True
+    if upper.startswith("NO"):
+        return False
+
+    # Fallback: find YES/NO anywhere in first 50 chars
+    if "YES" in upper[:50]:
+        _log(f"probe response contains YES (not at start): {content[:120]}")
+        return True
+    if "NO" in upper[:50]:
+        _log(f"probe response contains NO (not at start): {content[:120]}")
+        return False
+
+    _log(f"probe response has no YES/NO in first 50 chars: {content[:120]}")
+    return None
+
+
+def _is_permanent_error(error: Dict[str, Any]) -> bool:
+    """Return True for errors unlikely to self-resolve on retry."""
+    stderr = error.get("stderr", "")
+    error_msg = error.get("error", "")
+    # Transient: HTTP errors from DeepSeek (context window, rate limit, etc.)
+    if "HTTP Error" in stderr:
+        return False
+    # Transient: traceback in _send_captured is always HTTP/network level
+    if "urllib" in stderr and "_send_captured" in stderr:
+        return False
+    # Permanent: fork produced nothing and gave no explanation
+    # If stderr is present it's likely an API issue → transient
+    if "empty stdout" in error_msg:
+        return not bool(stderr)  # transient if stderr has content
+    # Permanent: unparseable response
+    if "JSON parse failed" in error_msg:
+        return True
+    # Unknown — be conservative, mark permanent
+    return True
+
+
+def _write_diary(content: str, sid: str, session_beg: str, session_end: str) -> None:
+    ts = datetime.now().strftime(_MSG_DT_FMT)  # local time
+    yaml_block = (
+        f"\n## {ts}\n\n"
+        f"```yaml proactive-diary\n"
+        f"session: {sid}\n"
+        f"source: proactive_diary\n"
+        f"beg: {session_beg}\n"
+        f"end: {session_end}\n"
+        f"```\n\n"
+        f"{content}\n"
+    )
+    _DIARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_DIARY_PATH, "a", encoding="utf-8") as f:
+        f.write(yaml_block)
+    _log(f"diary entry written ({len(content)} chars)")
+
+
+def _run_phase1(sid: str) -> tuple:
+    _log(f"phase1: probing {sid}")
+    result, error = _run_fork_json("--drop", "1", sid, PROBE_TEXT)
+    if result is None:
+        return None, error
+
+    try:
+        content = result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        content = ""
+    usage = result.get("usage", {})
+
+    hit = usage.get("cache_hit_tokens", 0) or 0
+    miss = usage.get("cache_miss_tokens", 0) or 0
+    total = hit + miss
+    pct = f"{hit / total * 100:.1f}" if total > 0 else "N/A"
+
+    _log(f"phase1: hit={pct}% response={content[:120]}")
+
+    return {
+        "content": content.strip(),
+        "hit_pct": pct,
+        "hit_tokens": hit,
+        "miss_tokens": miss,
+    }, None
+
+
+def _run_phase2(sid: str, write_text: str) -> tuple:
+    _log(f"phase2: writing diary for {sid}")
+    result, error = _run_fork_json(sid, write_text)
+    if result is None:
+        return None, error
+
+    try:
+        content = result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        content = ""
+    usage = result.get("usage", {})
+
+    hit = usage.get("cache_hit_tokens", 0) or 0
+    miss = usage.get("cache_miss_tokens", 0) or 0
+    total = hit + miss
+    pct = f"{hit / total * 100:.1f}" if total > 0 else "N/A"
+
+    _log(f"phase2: hit={pct}% content={len(content)} chars")
+
+    return {
+        "content": content.strip(),
+        "hit_pct": pct,
+        "hit_tokens": hit,
+        "miss_tokens": miss,
+    }, None
+
+
+# ── Main ────────────────────────────────────────────────────────────────
+
+def _process_session(
+    sid: str,
+    state: Dict[str, Any],
+    diary_entries: List[DiaryEntry],
+    *,
+    dryrun: bool = False,
+    force: bool = False,
+) -> None:
+    _log(f"===== processing: {sid} =====")
+
+    # ── Get last message (role + timestamp) ────────────────────────────
+    last_msg = _run_session_json("messages", sid, "-x", "session_meta", "-n", "1")
+    if not last_msg or len(last_msg) == 0:
+        return
+    msg_role = last_msg[0]["role"]
+    msg_ts = last_msg[0].get("timestamp", 0) or 0
+    ts_str = datetime.fromtimestamp(msg_ts).strftime(_MSG_DT_FMT) if msg_ts else "?"
+    preview = last_msg[0]["content_preview"].split("\n")[0][:80]
+    _log(f"  Last message at {ts_str} | {preview}")
+
+    entry = state.get(sid, {})
+    now = time.time()
+
+    # ── Change detection: skip if no new messages since last check ──────
+    if msg_ts and msg_ts == entry.get("last_seen_msg_ts"):
+        _log(f"  skip: no new messages (last_seen={ts_str})")
+        return
+
+    if not dryrun:
+        entry["last_seen_msg_ts"] = msg_ts
+
+    # ── Still processing: last message is user, wait for assistant ──────
+    if msg_role != "assistant":
+        if dryrun:
+            _log(f"  skip: last message is [{msg_role}] (Evo still processing)")
+            return
+        skips = entry.get("processing_skips", 0) + 1
+        entry["processing_skips"] = skips
+        backoff = min(2 ** (skips - 1), 30)
+        if skips >= 8:
+            _log(f"  skip: stuck processing for {skips} ticks — marking unexpected")
+            entry["unexpected_result"] = True
+        else:
+            _log(f"  skip: last message is [{msg_role}] (Evo still processing, "
+                 f"skip={skips}, backoff={backoff}m)")
+            last_skip = entry.get("last_processing_skip_at", 0)
+            if now - last_skip < backoff * 60:
+                _write_state(state)
+                return
+        entry["last_processing_skip_at"] = now
+        _write_state(state)
+        return
+
+    # Clear processing-skips counter when Evo has replied
+    if entry.get("processing_skips"):
+        entry.pop("processing_skips", None)
+        entry.pop("last_processing_skip_at", None)
+
+    # ── Quiet check: assistant just replied, let conversation settle ────
+    if not force and msg_ts and (now - msg_ts) < _QUIET_SECONDS:
+        _log(f"  skip: assistant replied {int(now - msg_ts)}s ago (quiet threshold={_QUIET_SECONDS}s)")
+        return
+
+    # ── Nearest diary entries ───────────────────────────────────────────
+    session_info = _run_session_json("info", sid)
+    session_ts = session_info.get("started_at", 0) if session_info else 0
+    if session_ts:
+        prev, nxt = _find_nearest_entries(session_ts, diary_entries)
+        prev_str = f"{prev.dt.strftime(_MSG_DT_FMT)} ({_humanize_gap(prev.dt.timestamp() - session_ts)})" if prev else "nothing before"
+        next_str = f"{nxt.dt.strftime(_MSG_DT_FMT)} ({_humanize_gap(nxt.dt.timestamp() - session_ts)})" if nxt else "nothing after"
+        _log(f"  Nearest diary: {prev_str} | {next_str}")
+
+    # ── Cooldown check: already wrote diary recently ────────────────────
+    if not force and _diary_cooldown_active(sid, diary_entries):
+        _log(f"  skip: cooldown active (cooldown={_COOLDOWN_HOURS}h)")
+        return
+
+    # Phase 1
+    if dryrun:
+        _log(f"would probe {sid}")
+        return
+
+    now = time.time()
+    p1, p1_err = _run_phase1(sid)
+
+    if p1 is None:
+        _log(f"phase1 failed (fork error)")
+        err_detail = p1_err or {"error": "unknown"}
+        # Diagnose empty stdout (subprocess RC=0 but no output)
+        if "empty stdout" in str(err_detail.get("error", "")):
+            _log(f"fork returned RC=0 with empty stdout. "
+                 f"cmd={err_detail.get('cmd', '?')} "
+                 f"stderr={str(err_detail.get('stderr', ''))[:200]}")
+        run = {
+            "at": now,
+            "phase1_failed": True,
+            "error": err_detail,
+        }
+        _record_run(state, sid, run)
+        # Only mark permanent for truly unexpected failures.
+        # HTTP 4xx / connectivity issues are transient — retry next tick.
+        is_perm = _is_permanent_error(err_detail)
+        if is_perm:
+            entry["unexpected_result"] = True
+        _log(f"phase1 error: perm={is_perm} detail={err_detail}")
+        _write_state(state)
+        return
+
+    result = _parse_yes_no(p1["content"])
+
+    if result is None:
+        _log(f"unexpected phase1 response: {p1['content'][:200]}")
+        run = {
+            "at": now,
+            "phase1_hit_pct": p1["hit_pct"],
+            "phase1_response": p1["content"],
+            "phase1_unexpected": True,
+            
+        }
+        _record_run(state, sid, run)
+        # Do NOT mark permanent — model glitch may self-recover next tick
+        _write_state(state)
+        return
+
+    if not result:
+        _log(f"skip: model said NO")
+        run = {
+            "at": now,
+            "phase1_hit_pct": p1["hit_pct"],
+            "phase1_response": "NO",
+            
+        }
+        _record_run(state, sid, run)
+        _write_state(state)
+        return
+
+    # ── Phase 2 ─────────────────────────────────────────────────────────
+    _log(f"model said YES, phase2...")
+    session_beg = ""
+    session_end = datetime.now().strftime(_MSG_DT_FMT)  # local time
+    if session_info and session_info.get("started_at"):
+        session_beg = datetime.fromtimestamp(session_info["started_at"]).strftime(_MSG_DT_FMT)
+    write_text = _build_write_prompt(diary_entries, session_beg, session_end, p1["content"])
+    p2, p2_err = _run_phase2(sid, write_text)
+
+    if p2 is None or not p2["content"]:
+        _log(f"phase2 failed or empty content")
+        run = {
+            "at": now,
+            "phase1_hit_pct": p1["hit_pct"],
+            "phase1_response": "YES",
+            "phase2_hit_pct": p2["hit_pct"] if p2 else "N/A",
+            "phase2_response": "",
+            "phase2_failed": True,
+            "phase2_error": p2_err or {},
+            
+        }
+        _record_run(state, sid, run)
+        _write_state(state)
+        return
+
+    # Phase 2 may also return NO if nothing new
+    p2_parsed = _parse_yes_no(p2["content"])
+    if p2_parsed is False:
+        _log(f"phase2: model chose not to write (reply NO)")
+        run = {
+            "at": now,
+            "phase1_hit_pct": p1["hit_pct"],
+            "phase1_response": "YES",
+            "phase2_hit_pct": p2["hit_pct"],
+            "phase2_response": "NO (chose not to write)",
+            
+        }
+        _record_run(state, sid, run)
+        _write_state(state)
+        return
+
+    _write_diary(p2["content"], sid, session_beg, session_end)
+
+    run = {
+        "at": now,
+        "phase1_hit_pct": p1["hit_pct"],
+        "phase1_response": "YES",
+        "phase2_hit_pct": p2["hit_pct"],
+        "phase2_response": p2["content"],
+        "diary_written": True,
+        
+    }
+    _record_run(state, sid, run)
+    _write_state(state)
+
+
+# ── CLI subcommands ──────────────────────────────────────────────────────
+
+def _cmd_write(argv: List[str]) -> None:
+    global _VERBOSE
+    manual_sid: Optional[str] = None
+    dryrun = False
+    force = False
+    limit: Optional[int] = None
+
+    while argv:
+        a = argv.pop(0)
+        if a in ("--dryrun",):
+            dryrun = True
+        elif a in ("--verbose",):
+            _VERBOSE = True
+        elif a in ("--force",):
+            force = True
+        elif a in ("-h", "--help"):
+            print(WRITE_HELP)
+            return
+        elif a == "-n":
+            if not argv:
+                print("diary: -n requires a number", file=sys.stderr)
+                sys.exit(1)
+            limit = int(argv.pop(0))
+        elif not a.startswith("-") and manual_sid is None:
+            manual_sid = a
+        else:
+            print(f"Unknown arg: {a}", file=sys.stderr)
+            sys.exit(1)
+
+    if force:
+        _log("FORCE mode — cooldown check skipped")
+
+    state = _read_state()
+    _prune_state(state)
+    diary_entries = _parse_all_diary_entries()
+
+    if manual_sid:
+        _process_session(manual_sid, state, diary_entries,
+                         dryrun=dryrun, force=force)
+        _log("write done (manual)")
+        return
+
+    list_args = ["list", "-s", "matrix", "--sort", "last-msg"]
+    list_args.extend(["-n", str(limit if limit is not None else 0)])
+    sessions = _run_session_json(*list_args)
+    if not sessions:
+        print("diary: no sessions found")
+        return
+
+    print(f"[diary] found {len(sessions)} sessions")
+    for session in sessions:
+        sid = session["id"]
+        _process_session(sid, state, diary_entries, dryrun=dryrun, force=force)
+
+    _log("write done")
+
+
+def _cmd_fix() -> None:
+    if not _DIARY_PATH.exists():
+        print("diary: no diary file found", file=sys.stderr)
+        sys.exit(1)
+
+    text = _DIARY_PATH.read_text(encoding="utf-8")
+    pattern = r"^## (\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})?)\n(.*?)(?=\n## |\Z)"
+    entries: List[tuple] = []
+    for m in re.finditer(pattern, text, re.DOTALL | re.MULTILINE):
+        dt_str = m.group(1)
+        body = m.group(2)
+        if " " not in dt_str:
+            dt_str += " 00:00:00"
+        try:
+            dt = datetime.strptime(dt_str, _MSG_DT_FMT)
+        except ValueError:
+            print(f"diary: cannot parse header '## {m.group(1)}', skipping", file=sys.stderr)
+            continue
+        entries.append((dt, dt_str, body.strip()))
+
+    entries.sort(key=lambda e: e[0])
+
+    with open(_DIARY_PATH, "w", encoding="utf-8") as f:
+        for _, dt_str, body in entries:
+            f.write(f"## {dt_str}\n{body}\n\n")
+
+    print(f"diary: sorted {len(entries)} entries")
+
+
+def _cmd_status() -> None:
+    state = _read_state()
+    if not state:
+        print("No state entries.")
+        return
+    entries: List[tuple] = []
+    for sid, entry_ in state.items():
+        info = _run_session_json("info", sid)
+        max_id = info.get("max_message_id", 0) if info else 0
+        entries.append((sid, entry_, info, max_id))
+    entries.sort(key=lambda e: e[3], reverse=True)
+    for sid, entry_, info, _ in entries:
+        title_str = f"  {info['title']}" if info and info.get("title") else ""
+        print(f"\n{sid}{title_str}")
+        last_msg = _run_session_json("messages", sid, "-x", "session_meta", "-n", "1")
+        if last_msg and len(last_msg) > 0:
+            ts = datetime.fromtimestamp(last_msg[0].get("timestamp", 0) or 0).strftime(_MSG_DT_FMT)
+            preview = last_msg[0]["content_preview"].split("\n")[0][:80]
+            print(f"  Last message at {ts} | {preview}")
+        runs = entry_.get("runs", []) if isinstance(entry_, dict) else []
+        for i, run in enumerate(runs):
+            at = datetime.fromtimestamp(run.get("at", 0)).strftime(_MSG_DT_FMT) if run.get("at") else "?"
+            ago = _humanize_time(run.get("at", 0)) if run.get("at") else ""
+            flags = []
+            if run.get("diary_written"):
+                flags.append("WRITTEN")
+            if run.get("phase1_failed") or run.get("phase2_failed"):
+                flags.append("FAILED")
+            flag_str = f"  [{' '.join(flags)}]" if flags else ""
+            print(f"  [Run {i + 1}] {at} ({ago})"
+                  f" hit={run.get('phase1_hit_pct', '?')}"
+                  f"{flag_str}")
+
+
+def _cmd_clear() -> None:
+    if _STATE_FILE.exists():
+        _STATE_FILE.unlink()
+        print(f"Cleared {_STATE_FILE}")
+    else:
+        print(f"No state file at {_STATE_FILE}")
+
+
+HELP = """diary — diary tools for Evo
+
+Usage: diary <command> [...]
+
+Commands:
+  write   probe conversations and write diary entries
+  fix     sort and normalize diary entries by datetime
+  status  show probe state and run history
+  clear   reset probe state
+
+Use 'diary <command> -h' for command-specific help.
+"""
+
+WRITE_HELP = """diary write — probe conversations for diary-worthy moments
+
+Usage: diary write [flags] [<sid>]
+
+Flags:
+  -n N       limit to N sessions (default: all)
+  --dryrun   no API calls, no state changes, no diary writes
+  --verbose  show subprocess commands
+  --force    skip cooldown check
+
+With no <sid>, scans all matrix sessions sorted by last message time.
+Pass a session id to probe a single session manually.
+"""
+
+
+def main() -> None:
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(HELP)
+        return
+
+    cmd = sys.argv[1]
+    argv = sys.argv[2:]
+
+    if cmd == "write":
+        _cmd_write(argv)
+    elif cmd == "fix":
+        _cmd_fix()
+    elif cmd == "status":
+        _cmd_status()
+    elif cmd == "clear":
+        _cmd_clear()
+    else:
+        print(HELP)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
