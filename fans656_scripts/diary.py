@@ -18,22 +18,26 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # ── Paths ───────────────────────────────────────────────────────────────
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 _HERMES_HOME = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes")))
-# _SCRIPTS_DIR is unreliable when run via os.execv from cron wrapper;
-# use an absolute path derived from HERMES_HOME.
 _FANS656_SCRIPTS = _HERMES_HOME / "hermes-agent" / "fans656_scripts"
 _STATE_FILE = _HERMES_HOME / "cron" / "proactive_diary" / "tmp" / "state.json"
 _DIARY_PATH = _HERMES_HOME / "workspace" / "evo-diary.md"
 
+# Import session module for direct DB access
+sys.path.insert(0, str(_FANS656_SCRIPTS.parent))
+from fans656_scripts import session as session_module
+
+_UTC8 = timezone(timedelta(hours=8))
 STATE_PRUNE_DAYS = 7
 MAX_RUNS_PER_SESSION = 3
 _MSG_DT_FMT = "%Y-%m-%d %H:%M:%S"
+_ISO_FMT = "%Y-%m-%dT%H:%M:%S%z"
 _COOLDOWN_HOURS = int(os.getenv("PROACTIVE_DIARY_COOLDOWN_HOURS", "2"))
 _QUIET_SECONDS = int(os.getenv("PROACTIVE_DIARY_QUIET_SECONDS", "300"))
 
@@ -55,18 +59,6 @@ def _log(msg: str) -> None:
 
 
 # ── Subprocess helpers ─────────────────────────────────────────────────
-
-def _run_session_json(*args: str) -> Any:
-    """Run session.py and return parsed JSON output."""
-    cmd = [sys.executable, str(_FANS656_SCRIPTS / "session.py"), *args, "--json"]
-    if _VERBOSE:
-        _log(f"[CALL] session {' '.join(args)}")
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    if r.returncode != 0:
-        _log(f"[ERR] session {r.stderr[:200]}")
-        return None
-    return json.loads(r.stdout) if r.stdout.strip() else None
-
 
 def _run_fork_json(*args: str) -> tuple:
     """Run fork.py --send and return (parsed_json_or_None, error_dict_or_None)."""
@@ -254,7 +246,7 @@ def _diary_cooldown_active(
 
 
 def _build_write_prompt(diary_entries: List[DiaryEntry],
-                         session_beg: str = "", session_end: str = "",
+                         beg_ts: float = 0,
                          probe_content: str = "") -> str:
     base = (
         "你现在是Evo的潜意识，决定写一篇日记。"
@@ -282,16 +274,11 @@ def _build_write_prompt(diary_entries: List[DiaryEntry],
     for e in diary_entries:
         if not e.text:
             continue
-        if not session_beg:
+        if not beg_ts:
             nearby.append(e)
             continue
-        try:
-            sess_dt = datetime.strptime(session_beg, _MSG_DT_FMT)
-            if abs((e.dt - sess_dt).total_seconds()) < 6 * 3600:
-                nearby.append(e)
-        except ValueError:
-            pass
-
+        if abs((e.dt.timestamp() - beg_ts)) < 6 * 3600:
+            nearby.append(e)
     if nearby:
         all_text = "\n\n---\n\n".join(e.text for e in nearby)
         return (
@@ -351,7 +338,7 @@ def _is_permanent_error(error: Dict[str, Any]) -> bool:
 
 
 def _write_diary(content: str, sid: str, session_beg: str, session_end: str) -> None:
-    ts = datetime.now().strftime(_MSG_DT_FMT)  # local time
+    ts = datetime.now(tz=_UTC8).strftime(_MSG_DT_FMT)
     yaml_block = (
         f"\n## {ts}\n\n"
         f"```yaml proactive-diary\n"
@@ -434,14 +421,20 @@ def _process_session(
 ) -> None:
     _log(f"===== processing: {sid} =====")
 
-    # ── Get last message (role + timestamp) ────────────────────────────
-    last_msg = _run_session_json("messages", sid, "-x", "session_meta", "-n", "1")
-    if not last_msg or len(last_msg) == 0:
+    # ── Get last + first message (role, timestamps) ─────────────────────
+    last_msgs = session_module.query_messages(sid, exclude_role="session_meta", limit=1)
+    if not last_msgs:
         return
-    msg_role = last_msg[0]["role"]
-    msg_ts = last_msg[0].get("timestamp", 0) or 0
+    msg_role = last_msgs[0].role
+    msg_ts = last_msgs[0].timestamp
+    end_ts = msg_ts
+    preview = last_msgs[0].content_preview.split("\n")[0][:80]
+
+    # First message time for beg
+    first_msgs = session_module.query_messages(sid, exclude_role="session_meta", limit=1, order="asc")
+    beg_ts = first_msgs[0].timestamp if first_msgs else 0
+
     ts_str = datetime.fromtimestamp(msg_ts).strftime(_MSG_DT_FMT) if msg_ts else "?"
-    preview = last_msg[0]["content_preview"].split("\n")[0][:80]
     _log(f"  Last message at {ts_str} | {preview}")
 
     entry = state.get(sid, {})
@@ -488,12 +481,10 @@ def _process_session(
         return
 
     # ── Nearest diary entries ───────────────────────────────────────────
-    session_info = _run_session_json("info", sid)
-    session_ts = session_info.get("started_at", 0) if session_info else 0
-    if session_ts:
-        prev, nxt = _find_nearest_entries(session_ts, diary_entries)
-        prev_str = f"{prev.dt.strftime(_MSG_DT_FMT)} ({_humanize_gap(prev.dt.timestamp() - session_ts)})" if prev else "nothing before"
-        next_str = f"{nxt.dt.strftime(_MSG_DT_FMT)} ({_humanize_gap(nxt.dt.timestamp() - session_ts)})" if nxt else "nothing after"
+    if beg_ts:
+        prev, nxt = _find_nearest_entries(beg_ts, diary_entries)
+        prev_str = f"{prev.dt.strftime(_MSG_DT_FMT)} ({_humanize_gap(prev.dt.timestamp() - beg_ts)})" if prev else "nothing before"
+        next_str = f"{nxt.dt.strftime(_MSG_DT_FMT)} ({_humanize_gap(nxt.dt.timestamp() - beg_ts)})" if nxt else "nothing after"
         _log(f"  Nearest diary: {prev_str} | {next_str}")
 
     # ── Cooldown check: already wrote diary recently ────────────────────
@@ -562,11 +553,9 @@ def _process_session(
 
     # ── Phase 2 ─────────────────────────────────────────────────────────
     _log(f"model said YES, phase2...")
-    session_beg = ""
-    session_end = datetime.now().strftime(_MSG_DT_FMT)  # local time
-    if session_info and session_info.get("started_at"):
-        session_beg = datetime.fromtimestamp(session_info["started_at"]).strftime(_MSG_DT_FMT)
-    write_text = _build_write_prompt(diary_entries, session_beg, session_end, p1["content"])
+    session_beg = datetime.fromtimestamp(beg_ts, tz=_UTC8).isoformat() if beg_ts else ""
+    session_end = datetime.fromtimestamp(end_ts, tz=_UTC8).isoformat() if end_ts else ""
+    write_text = _build_write_prompt(diary_entries, beg_ts, p1["content"])
     p2, p2_err = _run_phase2(sid, write_text)
 
     if p2 is None or not p2["content"]:
@@ -660,17 +649,16 @@ def _cmd_write(argv: List[str]) -> None:
         _log("write done (manual)")
         return
 
-    list_args = ["list", "-s", "matrix", "--sort", "last-msg"]
-    list_args.extend(["-n", str(limit if limit is not None else 0)])
-    sessions = _run_session_json(*list_args)
+    sessions = session_module.list_sessions(
+        source="matrix", sort_by="last-msg",
+        limit=0 if limit is None else limit)
     if not sessions:
         print("diary: no sessions found")
         return
 
     print(f"[diary] found {len(sessions)} sessions")
     for session in sessions:
-        sid = session["id"]
-        _process_session(sid, state, diary_entries, dryrun=dryrun, force=force)
+        _process_session(session.id, state, diary_entries, dryrun=dryrun, force=force)
 
     _log("write done")
 
@@ -681,17 +669,23 @@ def _cmd_fix() -> None:
         sys.exit(1)
 
     text = _DIARY_PATH.read_text(encoding="utf-8")
-    pattern = r"^## (\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})?)\n(.*?)(?=\n## |\Z)"
     entries: List[tuple] = []
+    pattern = r"^## (\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2})?)?)\n(.*?)(?=\n## |\Z)"
     for m in re.finditer(pattern, text, re.DOTALL | re.MULTILINE):
         dt_str = m.group(1)
-        body = m.group(2)
-        if " " not in dt_str:
+        body = m.group(2).strip()
+        if " " not in dt_str and "T" not in dt_str:
             dt_str += " 00:00:00"
-        try:
-            dt = datetime.strptime(dt_str, _MSG_DT_FMT)
-        except ValueError:
-            print(f"diary: cannot parse header '## {m.group(1)}', skipping", file=sys.stderr)
+        # Try old format first, then ISO
+        for fmt in (_MSG_DT_FMT, _ISO_FMT):
+            try:
+                dt = datetime.strptime(dt_str, fmt)
+                if fmt == _MSG_DT_FMT:
+                    dt = dt.replace(tzinfo=_UTC8)
+                break
+            except ValueError:
+                dt = None
+        if dt is None:
             continue
         entries.append((dt, dt_str, body.strip()))
 
@@ -711,17 +705,17 @@ def _cmd_status() -> None:
         return
     entries: List[tuple] = []
     for sid, entry_ in state.items():
-        info = _run_session_json("info", sid)
-        max_id = info.get("max_message_id", 0) if info else 0
+        info = session_module.get_info(sid)
+        max_id = info.max_message_id if info else 0
         entries.append((sid, entry_, info, max_id))
     entries.sort(key=lambda e: e[3], reverse=True)
     for sid, entry_, info, _ in entries:
-        title_str = f"  {info['title']}" if info and info.get("title") else ""
+        title_str = f"  {info.title}" if info and info.title else ""
         print(f"\n{sid}{title_str}")
-        last_msg = _run_session_json("messages", sid, "-x", "session_meta", "-n", "1")
-        if last_msg and len(last_msg) > 0:
-            ts = datetime.fromtimestamp(last_msg[0].get("timestamp", 0) or 0).strftime(_MSG_DT_FMT)
-            preview = last_msg[0]["content_preview"].split("\n")[0][:80]
+        last_msg = session_module.query_messages(sid, exclude_role="session_meta", limit=1)
+        if last_msg:
+            ts = datetime.fromtimestamp(last_msg[0].timestamp).strftime(_MSG_DT_FMT)
+            preview = last_msg[0].content_preview.split("\n")[0][:80]
             print(f"  Last message at {ts} | {preview}")
         runs = entry_.get("runs", []) if isinstance(entry_, dict) else []
         for i, run in enumerate(runs):

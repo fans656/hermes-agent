@@ -34,6 +34,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+__all__ = ["SessionInfo", "MessageInfo", "list_sessions", "get_info",
+           "query_messages", "find_by_content", "poll"]
+
 # ── Path setup ──────────────────────────────────────────────────────────
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
@@ -399,15 +402,19 @@ def query_messages(
     *,
     role: Optional[str] = None,
     exclude_role: Optional[str] = None,
-    last: int = 1,
+    limit: int = 1,
+    offset: int = 0,
+    order: str = "desc",
 ) -> List[MessageInfo]:
-    """Return the last N messages for a session, optionally filtered by role.
+    """Return messages for a session, optionally filtered by role.
 
     Args:
         session_id: Session to query.
         role: Only return messages with this role.
         exclude_role: Exclude messages with this role.
-        last: Number of recent messages to return (default 1).
+        limit: Max messages to return (default 1).
+        offset: Skip first N results (default 0).
+        order: \"desc\" (latest first, default) or \"asc\" (oldest first).
     """
     where_parts = ["session_id = ?"]
     params: list = [session_id]
@@ -419,6 +426,8 @@ def query_messages(
         where_parts.append("AND role != ?")
         params.append(exclude_role)
 
+    order_clause = "DESC" if order == "desc" else "ASC"
+
     where_clause = " ".join(where_parts)
     try:
         conn = _connect()
@@ -426,10 +435,12 @@ def query_messages(
             f"SELECT id, role, timestamp, substr(content, 1, 120) as content_preview "
             f"FROM messages "
             f"WHERE {where_clause} "
-            f"ORDER BY id DESC LIMIT ?",
-            (*params, last),
+            f"ORDER BY id {order_clause} LIMIT ? OFFSET ?",
+            (*params, limit, offset),
         ).fetchall()
         conn.close()
+        if order == "desc":
+            rows = list(reversed(rows))  # oldest first for caller convenience
         return [
             MessageInfo(
                 id=row["id"],
@@ -437,7 +448,7 @@ def query_messages(
                 timestamp=row["timestamp"] or 0.0,
                 content_preview=row["content_preview"] or "",
             )
-            for row in reversed(rows)  # oldest first
+            for row in rows
         ]
     except Exception as exc:
         print(f"session: query_messages({session_id}) failed: {exc}",
@@ -668,7 +679,9 @@ def _cmd_messages(args: argparse.Namespace) -> None:
         args.session_id,
         role=args.role,
         exclude_role=args.exclude_role,
-        last=args.last,
+        limit=args.limit,
+        offset=args.offset,
+        order=args.order,
     )
     if args.json:
         print(json.dumps([m.to_dict() for m in msgs],
@@ -730,13 +743,17 @@ def main() -> None:
     p_poll.add_argument("--json", action="store_true",
                         help="Output as JSON")
 
-    p_msgs = sub.add_parser("messages", help="Query recent messages")
+    p_msgs = sub.add_parser("messages", help="Query messages")
     p_msgs.add_argument("session_id", help="Session ID")
     p_msgs.add_argument("-r", "--role", help="Filter by role")
     p_msgs.add_argument("-x", "--exclude-role",
                         help="Exclude this role (e.g. session_meta)")
-    p_msgs.add_argument("-n", "--last", type=int, default=1,
-                        help="Number of recent messages (default 1)")
+    p_msgs.add_argument("-l", "--limit", type=int, default=1,
+                        help="Max messages (default 1)")
+    p_msgs.add_argument("-o", "--offset", type=int, default=0,
+                        help="Skip first N results")
+    p_msgs.add_argument("--order", choices=["desc", "asc"], default="desc",
+                        help="Sort order: desc (latest first) or asc")
     p_msgs.add_argument("--json", action="store_true",
                         help="Output as JSON array")
 
