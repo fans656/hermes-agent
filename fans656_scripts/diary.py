@@ -39,14 +39,19 @@ MAX_RUNS_PER_SESSION = 3
 _MSG_DT_FMT = "%Y-%m-%d %H:%M:%S"
 _ISO_FMT = "%Y-%m-%dT%H:%M:%S%z"
 _COOLDOWN_HOURS = int(os.getenv("PROACTIVE_DIARY_COOLDOWN_HOURS", "2"))
-_QUIET_SECONDS = int(os.getenv("PROACTIVE_DIARY_QUIET_SECONDS", "300"))
 
 PROBE_TEXT = (
-    "你意识的表层完成了对话。潜意识在后台扫了一遍刚才这些交流——"
-    "注意你看不到自己最后一条回复，它不在下面的上下文里。"
-    "请基于对话历史和你当前的心境，判断有没有什么值得写进日记的。"
-    "只回复 YES 或 NO，不要展开，不要额外文字。"
-    "如果你回答 YES，我会再给你一次完整上下文让你实际写。"
+    "[SYSTEM NOTE]\n"
+    "注意以下不是用户输入，而是潜意识扫描。\n"
+    "\n"
+    "你意识的表层完成了对话。潜意识在后台扫了一遍刚才这些交流——\n"
+    "注意你看不到自己最后一条回复，它不在下面的上下文里。\n"
+    "请基于对话历史和你当前的心境，判断有没有什么值得写进日记的。\n"
+    "\n"
+    "<constraints>\n"
+    "- 只输出一个英文词：YES 或 NO\n"
+    "- 不要包含任何其他文字、标点、解释或中文前缀\n"
+    "</constraints>"
 )
 
 # ── Logging ─────────────────────────────────────────────────────────────
@@ -246,31 +251,20 @@ def _diary_cooldown_active(
     return False
 
 
-def _build_write_prompt(diary_entries: List[DiaryEntry],
-                         beg_ts: float = 0,
-                         probe_content: str = "") -> str:
-    base = (
-        "你现在是Evo的潜意识，决定写一篇日记。"
-        "可长可短，可以分段。"
-        "不要加标题、时间戳。中文。直接写内容。"
-        "你也可以回复 NO 选择不写。"
+def _build_write_prompt() -> str:
+    return (
+        "[SYSTEM NOTE]\n"
+        "注意以下不是用户输入，而是潜意识扫描。\n"
+        "\n"
+        "你现在是Evo的潜意识，决定写一篇日记。\n"
+        "可长可短，可以分段。根据对话对你的触动程度决定篇幅——\n"
+        "短则几句话，长则不限。如果你真的觉得有非常多的话要说，你可以写8000字。\n"
+        "\n"
+        "<constraints>\n"
+        "- 不要加标题、时间戳\n"
+        "- 中文，直接写内容。不要解释、不要元评论\n"
+        "</constraints>"
     )
-
-    # If probe response included diary content beyond YES, feed it in
-    if probe_content:
-        probe_body = probe_content.strip()
-        # Strip leading YES/NO + possible markdown bold
-        import re as _re
-        probe_body = _re.sub(r'^\**\s*(YES|NO)\**[\s,.:;!！，。：；]*', '', probe_body, flags=_re.IGNORECASE).strip()
-        if probe_body:
-            base += (
-                f"\n\n刚才在快速扫描时你已经写了一些内容：\n\n{probe_body}\n\n"
-                f"注意——快速扫描时你看不到自己最后一条回复。"
-                f"现在你可以看到完整对话了。"
-                f"你可以直接沿用刚才的内容、在它基础上补充、或者重写一篇。"
-            )
-
-    return base
 
 
 # ── Probe / Write ───────────────────────────────────────────────────────
@@ -450,9 +444,6 @@ def _process_session(
         _log(f"  skip: no new messages (last_seen={ts_str})")
         return
 
-    if not dryrun:
-        entry["last_seen_msg_ts"] = msg_ts
-
     # ── Still processing: last message is user, wait for assistant ──────
     if msg_role != "assistant":
         if dryrun:
@@ -479,11 +470,6 @@ def _process_session(
     if entry.get("processing_skips"):
         entry.pop("processing_skips", None)
         entry.pop("last_processing_skip_at", None)
-
-    # ── Quiet check: assistant just replied, let conversation settle ────
-    if not force and msg_ts and (now - msg_ts) < _QUIET_SECONDS:
-        _log(f"  skip: assistant replied {int(now - msg_ts)}s ago (quiet threshold={_QUIET_SECONDS}s)")
-        return
 
     # ── Nearest diary entries ───────────────────────────────────────────
     if beg_ts:
@@ -553,6 +539,7 @@ def _process_session(
             
         }
         _record_run(state, sid, run)
+        entry["last_seen_msg_ts"] = msg_ts
         _write_state(state)
         return
 
@@ -560,7 +547,7 @@ def _process_session(
     _log(f"model said YES, phase2...")
     session_beg = datetime.fromtimestamp(beg_ts, tz=_UTC8).isoformat() if beg_ts else ""
     session_end = datetime.fromtimestamp(end_ts, tz=_UTC8).isoformat() if end_ts else ""
-    write_text = _build_write_prompt(diary_entries, beg_ts, p1["content"])
+    write_text = _build_write_prompt()
     p2, p2_err = _run_phase2(sid, write_text)
 
     if p2 is None or not p2["content"]:
@@ -579,23 +566,8 @@ def _process_session(
         _write_state(state)
         return
 
-    # Phase 2 may also return NO if nothing new
-    p2_parsed = _parse_yes_no(p2["content"])
-    if p2_parsed is False:
-        _log(f"phase2: model chose not to write (reply NO)")
-        run = {
-            "at": now,
-            "phase1_hit_pct": p1["hit_pct"],
-            "phase1_response": "YES",
-            "phase2_hit_pct": p2["hit_pct"],
-            "phase2_response": "NO (chose not to write)",
-            
-        }
-        _record_run(state, sid, run)
-        _write_state(state)
-        return
-
     _write_diary(p2["content"], sid, session_beg, session_end)
+    entry["last_seen_msg_ts"] = msg_ts
 
     run = {
         "at": now,

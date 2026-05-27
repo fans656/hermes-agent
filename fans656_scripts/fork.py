@@ -592,6 +592,7 @@ def main() -> None:
         if args.pretty:
             _print_pretty(source, messages, content, usage)
         else:
+            resp_data["usage"] = usage
             print(json.dumps(resp_data, ensure_ascii=False, indent=2))
         return
 
