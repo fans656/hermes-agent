@@ -269,50 +269,23 @@ def _build_write_prompt(diary_entries: List[DiaryEntry],
                 f"你可以直接沿用刚才的内容、在它基础上补充、或者重写一篇。"
             )
 
-    # Filter to entries near this session (within ~6h of session start)
-    nearby: List[DiaryEntry] = []
-    for e in diary_entries:
-        if not e.text:
-            continue
-        if not beg_ts:
-            nearby.append(e)
-            continue
-        if abs((e.dt.timestamp() - beg_ts)) < 6 * 3600:
-            nearby.append(e)
-    if nearby:
-        all_text = "\n\n---\n\n".join(e.text for e in nearby)
-        return (
-            f"{base}\n"
-            f"你之前已写过如下内容的日记：\n\n{all_text}\n\n"
-            f"只需补充之后的新内容。如果没什么新东西可写，回复 NO。"
-        )
     return base
 
 
 # ── Probe / Write ───────────────────────────────────────────────────────
 
 def _parse_yes_no(content: str) -> Optional[bool]:
-    # Strip markdown bold, then check
     cleaned = content.strip().replace("**", "").replace("*", "")
     if not cleaned:
         _log(f"probe response is empty after stripping")
         return None
-    upper = cleaned.upper()
 
-    if upper.startswith("YES"):
+    if "YES" in cleaned:
         return True
-    if upper.startswith("NO"):
+    if "NO" in cleaned:
         return False
 
-    # Fallback: find YES/NO anywhere in first 50 chars
-    if "YES" in upper[:50]:
-        _log(f"probe response contains YES (not at start): {content[:120]}")
-        return True
-    if "NO" in upper[:50]:
-        _log(f"probe response contains NO (not at start): {content[:120]}")
-        return False
-
-    _log(f"probe response has no YES/NO in first 50 chars: {content[:120]}")
+    _log(f"probe response has no YES/NO: {content[:120]}")
     return None
 
 
@@ -433,6 +406,37 @@ def _process_session(
     # First message time for beg
     first_msgs = session_module.query_messages(sid, exclude_role="session_meta", limit=1, order="asc")
     beg_ts = first_msgs[0].timestamp if first_msgs else 0
+
+    # ── Strip trailing tool/assistant+user from diary invocation ──
+    # When /diary is invoked from within the current session, the message
+    # sequence ends with: tool results → assistant with tool_call → user skill trigger.
+    # Walk backwards past these to find the real conversation exchange.
+    _stripped = 0
+    for _ in range(10):
+        if msg_role == "tool":
+            _stripped += 1
+        elif msg_role == "assistant":
+            # Check if the message before this assistant is a user message
+            # (the /diary skill trigger). If so, strip the pair.
+            _prev = session_module.query_messages(
+                sid, exclude_role="session_meta", limit=1, offset=_stripped + 1)
+            if _prev and _prev[0].role == "user":
+                _stripped += 2  # skip assistant + user
+            else:
+                break  # real assistant response, stop here
+        else:
+            break  # user or other role, stop here
+        # Fetch the message at the new offset
+        _next = session_module.query_messages(
+            sid, exclude_role="session_meta", limit=1, offset=_stripped)
+        if not _next:
+            break
+        msg_role = _next[0].role
+        msg_ts = _next[0].timestamp
+        end_ts = msg_ts
+        preview = _next[0].content_preview.split("\n")[0][:80]
+    if _stripped > 0:
+        _log(f"  stripped {_stripped} diary-invocation messages, landed on [{msg_role}]")
 
     ts_str = datetime.fromtimestamp(msg_ts).strftime(_MSG_DT_FMT) if msg_ts else "?"
     _log(f"  Last message at {ts_str} | {preview}")

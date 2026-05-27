@@ -247,6 +247,7 @@ def build_request(source: ForkSource, messages: List[Dict[str, Any]]) -> Dict[st
     else:
         body = {"model": source.model or DEFAULT_MODEL, "messages": messages}
     body["stream"] = False
+    body.pop("stream_options", None)
     return body
 
 
