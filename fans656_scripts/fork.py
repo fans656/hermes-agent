@@ -56,13 +56,20 @@ class ForkSource:
 
 # ── Load: captured ──────────────────────────────────────────────────────
 
-def _load_captured(session_id: str) -> Optional[ForkSource]:
+def _load_captured(session_id: str, seq: Optional[int] = None) -> Optional[ForkSource]:
     d = _CAPTURED_ROOT / session_id
     if not d.is_dir():
         return None
-    reqs = sorted(d.glob("*_req.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not reqs:
-        return None
+    if seq is not None:
+        req_path = d / f"{seq:03d}_req.json"
+        if not req_path.exists():
+            print(f"fork: --capture {seq}: {req_path.name} not found", file=sys.stderr)
+            return None
+        reqs = [req_path]
+    else:
+        reqs = sorted(d.glob("*_req.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not reqs:
+            return None
     seq = int(reqs[0].stem.split("_")[0])
     try:
         req = json.loads(reqs[0].read_text(encoding="utf-8"))
@@ -206,9 +213,9 @@ def _load_rebuild(session_id: str) -> Optional[ForkSource]:
 
 # ── Load (unified) ──────────────────────────────────────────────────────
 
-def load_source(session_id: str, *, rebuild: bool = False) -> Optional[ForkSource]:
+def load_source(session_id: str, *, rebuild: bool = False, capture_seq: Optional[int] = None) -> Optional[ForkSource]:
     if not rebuild:
-        src = _load_captured(session_id)
+        src = _load_captured(session_id, seq=capture_seq)
         if src:
             return src
     return _load_rebuild(session_id)
@@ -511,6 +518,8 @@ def main() -> None:
                         help="Send request to DeepSeek")
     parser.add_argument("--rebuild", action="store_true",
                         help="Force DB rebuild (ignore captured files)")
+    parser.add_argument("--capture", type=int, default=None,
+                        help="Use specific captured req file by seq (e.g. --capture 134)")
     parser.add_argument("--pretty", action="store_true",
                         help="Markdown-style output with frontmatter")
 
@@ -565,7 +574,7 @@ def main() -> None:
     sid: str = args.session_id
 
     # ── Load source ─────────────────────────────────────────────────────
-    source = load_source(sid, rebuild=args.rebuild)
+    source = load_source(sid, rebuild=args.rebuild, capture_seq=args.capture)
     if source is None:
         print(f"No source found for session: {sid}", file=sys.stderr)
         sys.exit(1)
