@@ -7805,14 +7805,19 @@ class GatewayRunner:
             if _show_reasoning_effective and response:
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
-                    # Collapse long reasoning to keep messages readable
-                    lines = last_reasoning.strip().splitlines()
-                    if len(lines) > 15:
-                        display_reasoning = "\n".join(lines[:15])
-                        display_reasoning += f"\n_... ({len(lines) - 15} more lines)_"
-                    else:
-                        display_reasoning = last_reasoning.strip()
-                    response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
+                    display_reasoning = last_reasoning.strip()
+                    # Use adaptive fence length to avoid breaking when
+                    # reasoning content contains triple-backticks.
+                    max_run = 0
+                    run = 0
+                    for ch in display_reasoning:
+                        if ch == '`':
+                            run += 1
+                            max_run = max(max_run, run)
+                        else:
+                            run = 0
+                    fence = '`' * max(3, max_run + 1)
+                    response = f"💭 **Reasoning:**\n{fence}\n{display_reasoning}\n{fence}\n\n{response}"
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
             # Off by default (display.runtime_footer.enabled=false).  When
