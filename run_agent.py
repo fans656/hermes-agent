@@ -1833,6 +1833,11 @@ class AIAgent:
 
             self.api_key = client_kwargs.get("api_key", "")
             self.base_url = client_kwargs.get("base_url", self.base_url)
+            # Capture flags must be set before _create_openai_client
+            # because _inject_capture_transport is called inside it.
+            self._capture_seq = 0
+            self._capture_raw = bool(os.getenv("HERMES_MODEL_RAW_REQ_CAPTURE"))
+            self._capture_dir = None
             try:
                 self.client = self._create_openai_client(client_kwargs, reason="agent_init", shared=True)
                 if not self.quiet_mode:
@@ -1933,6 +1938,17 @@ class AIAgent:
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
 
+        if self._capture_raw:
+            capture_dir = (
+                get_hermes_home() / "sessions" / "cache" / "captured"
+                / self.session_id
+            )
+            try:
+                capture_dir.mkdir(parents=True, exist_ok=True)
+                self._capture_dir = capture_dir
+            except Exception:
+                pass
+
         # Expose session ID to tools (terminal, execute_code) so agents can
         # reference their own session for --resume commands, cross-session
         # coordination, and logging.  Uses the ContextVar system from
@@ -1954,19 +1970,6 @@ class AIAgent:
         
         # Track conversation messages for session logging
         self._session_messages: List[Dict[str, Any]] = []
-        self._capture_seq = 0         # raw req capture counter (session-level)
-        self._capture_raw = bool(os.getenv("HERMES_MODEL_RAW_REQ_CAPTURE"))
-        self._capture_dir = None
-        if self._capture_raw:
-            capture_dir = (
-                get_hermes_home() / "sessions" / "cache" / "captured"
-                / self.session_id
-            )
-            try:
-                capture_dir.mkdir(parents=True, exist_ok=True)
-                self._capture_dir = capture_dir
-            except Exception:
-                pass
         self._memory_write_origin = "assistant_tool"
         self._memory_write_context = "foreground"
         
