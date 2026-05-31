@@ -3622,10 +3622,10 @@ class BasePlatformAdapter(ABC):
         """
         Split a long message into chunks, preserving code block boundaries.
 
-        When a split falls inside a triple-backtick code block, the fence is
+        When a split falls inside a fenced code block, the fence is
         closed at the end of the current chunk and reopened (with the original
-        language tag) at the start of the next chunk.  Multi-chunk responses
-        receive indicators like ``(1/3)``.
+        language tag and fence length) at the start of the next chunk.
+        Multi-chunk responses receive indicators like ``(1/3)``.
 
         Args:
             content: The full message content
@@ -3642,23 +3642,31 @@ class BasePlatformAdapter(ABC):
         if _len(content) <= max_length:
             return [content]
 
+        FENCE_RE = re.compile(r"^(`{3,})")
+
         INDICATOR_RESERVE = 10   # room for " (XX/XX)"
-        FENCE_CLOSE = "\n```"
 
         chunks: List[str] = []
         remaining = content
         # When the previous chunk ended mid-code-block, this holds the
         # language tag (possibly "") so we can reopen the fence.
         carry_lang: Optional[str] = None
+        # Holds the actual fence length (number of backticks) for carry-over.
+        carry_fence_len: Optional[int] = None
 
         while remaining:
-            # If we're continuing a code block from the previous chunk,
-            # prepend a new opening fence with the same language tag.
-            prefix = f"```{carry_lang}\n" if carry_lang is not None else ""
+            # Reopen with the same fence length as the original.
+            if carry_lang is not None and carry_fence_len is not None:
+                fence = "`" * carry_fence_len
+                prefix = f"{fence}{carry_lang}\n"
+            else:
+                prefix = ""
+            # The closing fence must have the same number of backticks.
+            close_fence = f"\n{'`' * (carry_fence_len or 3)}"
 
             # How much body text we can fit after accounting for the prefix,
             # a potential closing fence, and the chunk indicator.
-            headroom = max_length - INDICATOR_RESERVE - _len(prefix) - _len(FENCE_CLOSE)
+            headroom = max_length - INDICATOR_RESERVE - _len(prefix) - _len(close_fence)
             if headroom < 1:
                 headroom = max_length // 2
 
@@ -3687,25 +3695,34 @@ class BasePlatformAdapter(ABC):
                 split_at = _cp_limit
 
             # Avoid splitting inside an inline code span (`...`).
-            # If the text before split_at has an odd number of unescaped
-            # backticks, the split falls inside inline code — the resulting
-            # chunk would have an unpaired backtick and any special characters
-            # (like parentheses) inside the broken span would be unescaped,
-            # causing MarkdownV2 parse errors on Telegram.
-            candidate = remaining[:split_at]
-            backtick_count = candidate.count("`") - candidate.count("\\`")
-            if backtick_count % 2 == 1:
-                # Find the last unescaped backtick and split before it
-                last_bt = candidate.rfind("`")
-                while last_bt > 0 and candidate[last_bt - 1] == "\\":
-                    last_bt = candidate.rfind("`", 0, last_bt)
-                if last_bt > 0:
-                    # Try to find a space or newline just before the backtick
-                    safe_split = candidate.rfind(" ", 0, last_bt)
-                    nl_split = candidate.rfind("\n", 0, last_bt)
-                    safe_split = max(safe_split, nl_split)
-                    if safe_split > _cp_limit // 4:
-                        split_at = safe_split
+            # Only check when NOT inside a fenced code block — inside a fence,
+            # all backticks are literal content and the count is unreliable
+            # when fences use 4+ backticks.
+            if carry_lang is None:
+                candidate = remaining[:split_at]
+                backtick_count = candidate.count("`") - candidate.count("\\`")
+                if backtick_count % 2 == 1:
+                    # Find the last unescaped backtick and split before it
+                    last_bt = candidate.rfind("`")
+                    while last_bt > 0 and candidate[last_bt - 1] == "\\":
+                        last_bt = candidate.rfind("`", 0, last_bt)
+                    if last_bt > 0:
+                        # Try to find a space or newline just before the backtick
+                        safe_split = candidate.rfind(" ", 0, last_bt)
+                        nl_split = candidate.rfind("\n", 0, last_bt)
+                        safe_split = max(safe_split, nl_split)
+                        if safe_split > _cp_limit // 4:
+                            split_at = safe_split
+
+            # If split falls inside a backtick-only line (fence line),
+            # advance to the next newline so the fence is never cut.
+            if split_at > 0:
+                next_nl = remaining.find("\n", split_at)
+                if next_nl == -1:
+                    next_nl = len(remaining)
+                line_remainder = remaining[split_at:next_nl].strip()
+                if line_remainder and all(c == "`" for c in line_remainder):
+                    split_at = next_nl + 1 if next_nl < len(remaining) else len(remaining)
 
             chunk_body = remaining[:split_at]
             remaining = remaining[split_at:].lstrip()
@@ -3716,23 +3733,31 @@ class BasePlatformAdapter(ABC):
             # determine whether we end inside an open code block.
             in_code = carry_lang is not None
             lang = carry_lang or ""
+            fence_len = carry_fence_len
             for line in chunk_body.split("\n"):
-                stripped = line.strip()
-                if stripped.startswith("```"):
+                m = FENCE_RE.match(line.strip())
+                if m:
+                    current_fence_len = len(m.group(1))
                     if in_code:
-                        in_code = False
-                        lang = ""
+                        # Closing fence: must have >= backticks than opening.
+                        if fence_len is None or current_fence_len >= fence_len:
+                            in_code = False
+                            lang = ""
+                            fence_len = None
                     else:
                         in_code = True
-                        tag = stripped[3:].strip()
+                        tag = line.strip()[current_fence_len:].strip()
                         lang = tag.split()[0] if tag else ""
+                        fence_len = current_fence_len
 
-            if in_code:
+            if in_code and fence_len:
                 # Close the orphaned fence so the chunk is valid on its own
-                full_chunk += FENCE_CLOSE
+                full_chunk += f"\n{'`' * fence_len}"
                 carry_lang = lang
+                carry_fence_len = fence_len
             else:
                 carry_lang = None
+                carry_fence_len = None
 
             chunks.append(full_chunk)
 
@@ -3740,7 +3765,7 @@ class BasePlatformAdapter(ABC):
         if len(chunks) > 1:
             total = len(chunks)
             chunks = [
-                f"{chunk} ({i + 1}/{total})" for i, chunk in enumerate(chunks)
+                f"{chunk}\n({i + 1}/{total})" for i, chunk in enumerate(chunks)
             ]
 
         return chunks
