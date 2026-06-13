@@ -69,6 +69,7 @@ class SessionInfo:
     title: str = ""
     model: str = ""
     preview: str = ""
+    last_msg_preview: str = ""
 
     @property
     def has_captured(self) -> bool:
@@ -88,6 +89,7 @@ class SessionInfo:
             "title": self.title,
             "model": self.model,
             "preview": self.preview,
+            "last_msg_preview": self.last_msg_preview,
         }
 
 
@@ -133,6 +135,7 @@ def _row_to_info(row: Any) -> SessionInfo:
         title=d.get("title", "") or "",
         model=d.get("model", ""),
         preview=d.get("preview", ""),
+        last_msg_preview=d.get("last_msg_preview", ""),
     )
 
 
@@ -235,9 +238,12 @@ def list_sessions(
                        s.started_at, s.ended_at,
                        COALESCE((SELECT MAX(m.id) FROM messages m
                                   WHERE m.session_id = s.id), 0) as max_message_id,
-                       COALESCE((SELECT substr(m2.content, 1, 80) FROM messages m2
+                       COALESCE((SELECT substr(REPLACE(REPLACE(m2.content, X'0A', ' '), X'0D', ' '), 1, 80) FROM messages m2
                                   WHERE m2.session_id = s.id AND m2.role = 'user'
-                                  ORDER BY m2.id ASC LIMIT 1), '') as preview
+                                  ORDER BY m2.id ASC LIMIT 1), '') as preview,
+                       COALESCE((SELECT substr(REPLACE(REPLACE(m3.content, X'0A', ' '), X'0D', ' '), 1, 80) FROM messages m3
+                                  WHERE m3.session_id = s.id AND m3.content IS NOT NULL
+                                  ORDER BY m3.id DESC LIMIT 1), '') as last_msg_preview
                 FROM sessions s
                 WHERE {' '.join(where_parts)}
                 {order_clause} {limit_clause}""",
@@ -571,7 +577,7 @@ def _cmd_list(args: argparse.Namespace) -> None:
         cols = [f"{'SESSION_ID':<42}", f"{'SRC':>6}", f"{'MSGS':>5}"]
         if args.show_capture_detail:
             cols.extend([f"{'CAPT':>5}", "  LAST_CAPTURED"])
-        cols.append("TITLE")
+        cols.append("LAST MSG")
         print("  ".join(cols))
         print("-" * (len("  ".join(cols))))
 
@@ -589,7 +595,7 @@ def _cmd_list(args: argparse.Namespace) -> None:
                     else "-"
                 )
                 row.extend([f"{cap_str:>5}", f"  {last_str}"])
-            title = s.title[:60] if s.title else "-"
+            title = s.last_msg_preview[:60] if s.last_msg_preview else "-"
             row.append(title)
             print("  ".join(row))
 
@@ -706,8 +712,8 @@ def main() -> None:
     p_list.add_argument("--all", action="store_true",
                         help="Return all sessions (overrides -n)")
     p_list.add_argument("--sort", choices=["started", "last-msg"],
-                        default="started",
-                        help="Sort by started_at (default) or last message time")
+                        default="last-msg",
+                        help="Sort by started_at or last message time (default: last-msg)")
     p_list.add_argument("--captured", action="store_true",
                         help="Only sessions with captured req/resp pairs")
     p_list.add_argument("--show-capture-detail", action="store_true",
