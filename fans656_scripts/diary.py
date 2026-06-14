@@ -410,6 +410,7 @@ def _process_session(
     *,
     dryrun: bool = False,
     force: bool = False,
+    drop_n: Optional[int] = None,
 ) -> None:
     _log(f"===== processing: {sid} =====")
 
@@ -465,8 +466,28 @@ def _process_session(
     if _stripped > 0:
         _log(f"  stripped {_stripped} diary-invocation messages, landed on [{msg_role}]")
 
+    # ── Forced drop (--drop N) ──────────────────────────────────────
+    if drop_n is not None and drop_n > 0:
+        for _ in range(drop_n):
+            _next = session_module.query_messages(
+                sid, exclude_role="session_meta", limit=1, offset=_stripped)
+            if not _next:
+                break
+            _stripped += 1
+            msg_role = _next[0].role
+            msg_ts = _next[0].timestamp
+            end_ts = msg_ts
+            preview = _next[0].content_preview.split("\n")[0][:80]
+        _log(f"  force-dropped {drop_n} messages, landed on [{msg_role}]")
+
     ts_str = datetime.fromtimestamp(msg_ts).strftime(_MSG_DT_FMT) if msg_ts else "?"
     _log(f"  Last message at {ts_str} | {preview}")
+
+    # ── Dryrun: show target and exit early ──────────────────────────
+    if dryrun:
+        _log(f"  would probe {sid}")
+        _log(f"  landed on [{msg_role}] {ts_str} | {preview}")
+        return
 
     entry = state.get(sid, {})
     now = time.time()
@@ -521,10 +542,6 @@ def _process_session(
         return
 
     # Phase 1
-    if dryrun:
-        _log(f"would probe {sid}")
-        return
-
     now = time.time()
     p1, p1_err = _run_phase1(sid)
 
@@ -626,6 +643,7 @@ def _cmd_write(argv: List[str]) -> None:
     manual_sid: Optional[str] = None
     dryrun = False
     force = False
+    drop_n: Optional[int] = None
     limit: Optional[int] = None
 
     while argv:
@@ -636,6 +654,11 @@ def _cmd_write(argv: List[str]) -> None:
             _VERBOSE = True
         elif a in ("--force",):
             force = True
+        elif a == "--drop":
+            if not argv:
+                print("diary: --drop requires a number", file=sys.stderr)
+                sys.exit(1)
+            drop_n = int(argv.pop(0))
         elif a in ("-h", "--help"):
             print(WRITE_HELP)
             return
@@ -659,7 +682,7 @@ def _cmd_write(argv: List[str]) -> None:
 
     if manual_sid:
         _process_session(manual_sid, state, diary_entries,
-                         dryrun=dryrun, force=force)
+                         dryrun=dryrun, force=force, drop_n=drop_n)
         _log("write done (manual)")
         return
 
@@ -773,7 +796,8 @@ Usage: diary write [flags] [<sid>]
 
 Flags:
   -n N       limit to N sessions (default: all)
-  --dryrun   no API calls, no state changes, no diary writes
+  --drop N   skip last N messages before probing
+  --dryrun   no API calls, no state changes, no diary writes; shows target message
   --verbose  show subprocess commands
   --force    skip active check + cooldown
 
