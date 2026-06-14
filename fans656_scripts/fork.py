@@ -19,12 +19,68 @@ Examples::
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+
+# ── Response callback ──────────────────────────────────────────────────
+# A callback is loaded via --on-response <path>:<funcname> and receives:
+#   callback(response: dict, ctx: ResponseContext) -> "accept" | "retry"
+#
+# The caller can call ctx.add_message(msg) to append messages before a retry.
+
+class ResponseContext:
+    """Mutable context passed to --on-response callbacks."""
+    def __init__(self, messages: List[Dict[str, Any]]):
+        self._messages = list(messages)
+        self._pending: List[Dict[str, Any]] = []
+
+    def add_message(self, msg: Dict[str, Any]) -> None:
+        self._pending.append(msg)
+
+    @property
+    def messages(self) -> List[Dict[str, Any]]:
+        return list(self._messages) + list(self._pending)
+
+    def commit_pending(self) -> None:
+        self._messages.extend(self._pending)
+        self._pending = []
+
+
+def load_callback(spec: str) -> Optional[Callable]:
+    """Load a callback from '<path>:<funcname>' or '<modulename>:<funcname>'."""
+    try:
+        path, funcname = spec.rsplit(":", 1)
+    except ValueError:
+        print(f"fork: --on-response: expected '<path>:<funcname>', got '{spec}'", file=sys.stderr)
+        return None
+
+    # Try as file path first
+    p = Path(path)
+    if p.exists():
+        modname = p.stem.replace("-", "_")
+        spec_loader = importlib.util.spec_from_file_location(modname, p)
+        if spec_loader is None:
+            print(f"fork: could not load module from '{p}'", file=sys.stderr)
+            return None
+        mod = importlib.util.module_from_spec(spec_loader)
+        sys.modules[modname] = mod
+        spec_loader.loader.exec_module(mod)
+    else:
+        print(f"fork: callback file not found: '{p}'", file=sys.stderr)
+        return None
+
+    fn = getattr(mod, funcname, None)
+    if not callable(fn):
+        print(f"fork: '{funcname}' is not callable in '{p}'", file=sys.stderr)
+        return None
+    print(f"fork: loaded response callback: {p}:{funcname}", file=sys.stderr)
+    return fn
 
 # ── Path ────────────────────────────────────────────────────────────────
 _REPO = Path(__file__).resolve().parent.parent
@@ -388,41 +444,75 @@ def _print_pretty(source: ForkSource, messages: List[Dict[str, Any]],
 def _send_captured(
     source: ForkSource,
     messages: List[Dict[str, Any]],
+    response_callback: Optional[Callable] = None,
+    max_retries: int = 1,
 ) -> Tuple[Any, str, Dict[str, Any]]:
-    """POST exact HTTP body bytes to DeepSeek. Returns (response, content, usage)."""
+    """POST exact HTTP body bytes to DeepSeek. Returns (response, content, usage).
+
+    If response_callback is set, it's called with (response, ResponseContext) after
+    each API call. Return "accept" to finish or "retry" to loop (up to max_retries).
+    """
     api_key = _deepseek_api_key()
     body = build_request(source, messages)
-    body_json = json.dumps(body, ensure_ascii=False, default=str, separators=(",", ":"))
 
+    # -- Response callback loop ------------------------------------------------
+    current_messages = list(messages)
     import urllib.request
     import urllib.error
-    req = urllib.request.Request(
-        "https://api.deepseek.com/v1/chat/completions",
-        data=body_json.encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        raw = urllib.request.urlopen(req, timeout=120).read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "fp") and exc.fp else ""
-        print(f"fork: HTTP {exc.code} {exc.reason}: {body_text[:300]}", file=sys.stderr)
-        return None, "", {}
+    for attempt in range(max_retries + 1):
+        if response_callback:
+            print(f"fork: callback attempt {attempt + 1}/{max_retries + 1}", file=sys.stderr)
+        # Build and send request
+        b = dict(body)
+        b["messages"] = current_messages
+        bj = json.dumps(b, ensure_ascii=False, default=str, separators=(",", ":"))
+        try:
+            raw = urllib.request.urlopen(urllib.request.Request(
+                "https://api.deepseek.com/v1/chat/completions",
+                data=bj.encode("utf-8"),
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            ), timeout=120).read().decode("utf-8")
+            resp = json.loads(raw)
+        except (urllib.error.HTTPError, json.JSONDecodeError, ValueError) as exc:
+            print(f"fork: request failed: {exc}", file=sys.stderr)
+            return None, "", {}
 
-    # Parse non-streaming response
-    try:
-        resp = json.loads(raw)
-    except (json.JSONDecodeError, ValueError) as exc:
-        print(f"fork: failed to parse response: {exc}", file=sys.stderr)
-        return None, "", {}
-    choices = resp.get("choices", [])
-    content = ""
-    if choices and len(choices) > 0:
-        content = choices[0].get("message", {}).get("content", "") or ""
-    usage_data = resp.get("usage") or {}
-    usage = _extract_usage_from_dict({"usage": usage_data} if usage_data else {})
+        choices = resp.get("choices", [])
+        if choices and len(choices) > 0:
+            content = choices[0].get("message", {}).get("content", "") or ""
+        usage_data = resp.get("usage") or {}
+        usage = _extract_usage_from_dict({"usage": usage_data} if usage_data else {})
+
+        # If no callback or last attempt, accept
+        if not response_callback or attempt >= max_retries:
+            break
+
+        # Ask callback: accept or retry
+        ctx = ResponseContext(current_messages)
+        try:
+            decision = response_callback(resp, ctx)
+        except Exception as exc:
+            print(f"fork: response_callback error: {exc}", file=sys.stderr)
+            break
+
+        if decision == "retry":
+            ctx.commit_pending()
+            n_pending = len(ctx._pending) if hasattr(ctx, '_pending') else 0
+            print(f"fork: callback returned retry ({n_pending} tool responses queued)", file=sys.stderr)
+            # Add assistant tool_calls message before the tool responses
+            assistant_tc = choices[0].get("message", {}).get("tool_calls")
+            if assistant_tc:
+                current_messages = ctx.messages
+                # Insert assistant's tool_calls message right before the tool responses
+                assistant_msg = {"role": "assistant", "tool_calls": assistant_tc}
+                tool_count = len(assistant_tc)
+                current_messages.insert(-tool_count, assistant_msg)
+            else:
+                current_messages = ctx.messages
+            continue
+        # "accept" → break
+        print(f"fork: callback returned accept", file=sys.stderr)
+        break
 
     return {"choices": [{"message": {"content": content}}]}, content, usage
 
@@ -430,40 +520,66 @@ def _send_captured(
 def _send_rebuild(
     source: ForkSource,
     messages: List[Dict[str, Any]],
+    response_callback: Optional[Callable] = None,
+    max_retries: int = 1,
 ) -> Tuple[Any, str, Dict[str, Any]]:
-    """POST to DeepSeek without captured api_kwargs. Returns (response, content, usage)."""
+    """POST to DeepSeek without captured api_kwargs. Returns (response, content, usage).
+
+    If response_callback is set, it's called with (response, ResponseContext) after
+    each API call. Return "accept" to finish or "retry" to loop (up to max_retries).
+    """
     api_key = _deepseek_api_key()
-    body = build_request(source, messages)
-    body_json = json.dumps(body, ensure_ascii=False, default=str, separators=(",", ":"))
 
-    import urllib.request
-    import urllib.error
-    req = urllib.request.Request(
-        "https://api.deepseek.com/v1/chat/completions",
-        data=body_json.encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        raw = urllib.request.urlopen(req, timeout=120).read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "fp") and exc.fp else ""
-        print(f"fork: HTTP {exc.code} {exc.reason}: {body_text[:300]}", file=sys.stderr)
-        return None, "", {}
+    current_messages = list(messages)
+    for attempt in range(max_retries + 1):
+        body = build_request(source, current_messages)
+        body_json = json.dumps(body, ensure_ascii=False, default=str, separators=(",", ":"))
 
-    try:
-        resp = json.loads(raw)
-    except (json.JSONDecodeError, ValueError) as exc:
-        print(f"fork: failed to parse response: {exc}", file=sys.stderr)
-        return None, "", {}
-    choices = resp.get("choices", [])
-    content = ""
-    if choices and len(choices) > 0:
-        content = choices[0].get("message", {}).get("content", "") or ""
-    usage_data = resp.get("usage") or {}
-    usage = _extract_usage_from_dict({"usage": usage_data} if usage_data else {})
+        import urllib.request
+        import urllib.error
+        try:
+            raw = urllib.request.urlopen(urllib.request.Request(
+                "https://api.deepseek.com/v1/chat/completions",
+                data=body_json.encode("utf-8"),
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            ), timeout=120).read().decode("utf-8")
+            resp = json.loads(raw)
+        except (urllib.error.HTTPError, json.JSONDecodeError, ValueError) as exc:
+            print(f"fork: request failed: {exc}", file=sys.stderr)
+            return None, "", {}
+
+        choices = resp.get("choices", [])
+        content = ""
+        if choices and len(choices) > 0:
+            content = choices[0].get("message", {}).get("content", "") or ""
+        usage_data = resp.get("usage") or {}
+        usage = _extract_usage_from_dict({"usage": usage_data} if usage_data else {})
+
+        if not response_callback or attempt >= max_retries:
+            break
+
+        print(f"fork: callback attempt {attempt + 1}/{max_retries + 1}", file=sys.stderr)
+        ctx = ResponseContext(current_messages)
+        try:
+            decision = response_callback(resp, ctx)
+        except Exception as exc:
+            print(f"fork: response_callback error: {exc}", file=sys.stderr)
+            break
+
+        if decision == "retry":
+            ctx.commit_pending()
+            n_pending = len(ctx._pending) if hasattr(ctx, '_pending') else 0
+            print(f"fork: callback returned retry ({n_pending} tool responses queued)", file=sys.stderr)
+            assistant_tc = choices[0].get("message", {}).get("tool_calls")
+            if assistant_tc:
+                current_messages = ctx.messages
+                tool_count = len(assistant_tc)
+                current_messages.insert(-tool_count, {"role": "assistant", "tool_calls": assistant_tc})
+            else:
+                current_messages = ctx.messages
+            continue
+        print(f"fork: callback returned accept", file=sys.stderr)
+        break
 
     return {"choices": [{"message": {"content": content}}]}, content, usage
 
@@ -522,6 +638,10 @@ def main() -> None:
                         help="Use specific captured req file by seq (e.g. --capture 134)")
     parser.add_argument("--pretty", action="store_true",
                         help="Markdown-style output with frontmatter")
+    parser.add_argument("--on-response", metavar="PATH:FUNC",
+                        help="Load a callback: fn(response, ctx) -> 'accept'|'retry'")
+    parser.add_argument("--max-retries", type=int, default=1,
+                        help="Max retries when callback returns 'retry' (default: 1)")
 
     args = parser.parse_args()
 
@@ -593,10 +713,11 @@ def main() -> None:
 
     # ── --send ──────────────────────────────────────────────────────────
     if args.send:
+        cb = load_callback(args.on_response) if args.on_response else None
         if source.kind == "captured":
-            resp_data, content, usage = _send_captured(source, messages)
+            resp_data, content, usage = _send_captured(source, messages, response_callback=cb, max_retries=args.max_retries)
         else:
-            resp_data, content, usage = _send_rebuild(source, messages)
+            resp_data, content, usage = _send_rebuild(source, messages, response_callback=cb, max_retries=args.max_retries)
 
         if args.pretty:
             _print_pretty(source, messages, content, usage)

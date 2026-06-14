@@ -39,6 +39,8 @@ MAX_RUNS_PER_SESSION = 3
 _MSG_DT_FMT = "%Y-%m-%d %H:%M:%S"
 _ISO_FMT = "%Y-%m-%dT%H:%M:%S%z"
 _COOLDOWN_HOURS = int(os.getenv("PROACTIVE_DIARY_COOLDOWN_HOURS", "2"))
+_COOLDOWN_ENABLED = False  # temporarily disabled for cron; flip to True to enable
+_ACTIVE_CHECK_THRESHOLD = 600  # 10min — session still hot if last msg within this
 
 PROBE_TEXT = (
     "[SYSTEM NOTE]\n"
@@ -353,9 +355,28 @@ def _run_phase1(sid: str) -> tuple:
     }, None
 
 
+def _fork_response_handle(response: dict, ctx) -> str:
+    """Response callback for --on-response: retry when model calls tools."""
+    choices = response.get("choices", [])
+    if not choices:
+        return "accept"
+    msg = choices[0].get("message", {})
+    tool_calls = msg.get("tool_calls")
+    if not tool_calls:
+        return "accept"
+    for tc in tool_calls:
+        ctx.add_message({
+            "role": "tool",
+            "tool_call_id": tc.get("id", "call_unknown"),
+            "content": "请直接输出文字内容，不要调用任何工具。",
+        })
+    return "retry"
+
+
 def _run_phase2(sid: str, write_text: str) -> tuple:
     _log(f"phase2: writing diary for {sid}")
-    result, error = _run_fork_json(sid, write_text)
+    cb_path = Path(__file__).resolve()
+    result, error = _run_fork_json("--on-response", f"{cb_path}:_fork_response_handle", sid, write_text)
     if result is None:
         return None, error
 
@@ -409,6 +430,14 @@ def _process_session(
     # When /diary is invoked from within the current session, the message
     # sequence ends with: tool results → assistant with tool_call → user skill trigger.
     # Walk backwards past these to find the real conversation exchange.
+    # IMPORTANT: only strip when the user message content looks like a diary
+    # invocation (/diary command or probe text), not real conversation messages.
+
+    def _is_diary_invocation(content: str) -> bool:
+        """Check if a user message is a diary invocation rather than real input."""
+        c = content.strip()
+        return c.startswith("/diary") or "[system note]" in c.lower() or "潜意识扫描" in c
+
     _stripped = 0
     for _ in range(10):
         if msg_role == "tool":
@@ -418,7 +447,7 @@ def _process_session(
             # (the /diary skill trigger). If so, strip the pair.
             _prev = session_module.query_messages(
                 sid, exclude_role="session_meta", limit=1, offset=_stripped + 1)
-            if _prev and _prev[0].role == "user":
+            if _prev and _prev[0].role == "user" and _is_diary_invocation(_prev[0].content_preview):
                 _stripped += 2  # skip assistant + user
             else:
                 break  # real assistant response, stop here
@@ -445,6 +474,11 @@ def _process_session(
     # ── Change detection: skip if no new messages since last check ──────
     if msg_ts and msg_ts == entry.get("last_seen_msg_ts"):
         _log(f"  skip: no new messages (last_seen={ts_str})")
+        return
+
+    # ── Active conversation check: skip if session still warm ───────────
+    if not force and msg_ts and (now - msg_ts) < _ACTIVE_CHECK_THRESHOLD:
+        _log(f"  skip: session warm ({_humanize_gap(now - msg_ts)} since last msg)")
         return
 
     # ── Still processing: last message is user, wait for assistant ──────
@@ -482,7 +516,7 @@ def _process_session(
         _log(f"  Nearest diary: {prev_str} | {next_str}")
 
     # ── Cooldown check: already wrote diary recently ────────────────────
-    if not force and _diary_cooldown_active(sid, diary_entries):
+    if _COOLDOWN_ENABLED and not force and _diary_cooldown_active(sid, diary_entries):
         _log(f"  skip: cooldown active (cooldown={_COOLDOWN_HOURS}h)")
         return
 
@@ -617,7 +651,7 @@ def _cmd_write(argv: List[str]) -> None:
             sys.exit(1)
 
     if force:
-        _log("FORCE mode — cooldown check skipped")
+        _log("FORCE mode — active check + cooldown skipped")
 
     state = _read_state()
     _prune_state(state)
@@ -741,7 +775,7 @@ Flags:
   -n N       limit to N sessions (default: all)
   --dryrun   no API calls, no state changes, no diary writes
   --verbose  show subprocess commands
-  --force    skip cooldown check
+  --force    skip active check + cooldown
 
 With no <sid>, scans all matrix sessions sorted by last message time.
 Pass a session id to probe a single session manually.
