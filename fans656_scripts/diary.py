@@ -328,9 +328,10 @@ def _write_diary(content: str, sid: str, session_beg: str, session_end: str) -> 
     _log(f"diary entry written ({len(content)} chars)")
 
 
-def _run_phase1(sid: str) -> tuple:
+def _run_phase1(sid: str, drop_extra: int = 0) -> tuple:
     _log(f"phase1: probing {sid}")
-    result, error = _run_fork_json("--drop", "1", sid, PROBE_TEXT)
+    total_drop = 1 + drop_extra  # 1 for probe formatting + user's --drop N
+    result, error = _run_fork_json("--drop", str(total_drop), sid, PROBE_TEXT)
     if result is None:
         return None, error
 
@@ -373,10 +374,14 @@ def _fork_response_handle(response: dict, ctx) -> str:
     return "retry"
 
 
-def _run_phase2(sid: str, write_text: str) -> tuple:
+def _run_phase2(sid: str, write_text: str, drop_extra: int = 0) -> tuple:
     _log(f"phase2: writing diary for {sid}")
     cb_path = Path(__file__).resolve()
-    result, error = _run_fork_json("--on-response", f"{cb_path}:_fork_response_handle", sid, write_text)
+    args = ["--on-response", f"{cb_path}:_fork_response_handle"]
+    if drop_extra > 0:
+        args += ["--drop", str(drop_extra)]
+    args += [sid, write_text]
+    result, error = _run_fork_json(*args)
     if result is None:
         return None, error
 
@@ -543,7 +548,7 @@ def _process_session(
 
     # Phase 1
     now = time.time()
-    p1, p1_err = _run_phase1(sid)
+    p1, p1_err = _run_phase1(sid, drop_extra=drop_n or 0)
 
     if p1 is None:
         _log(f"phase1 failed (fork error)")
@@ -602,7 +607,7 @@ def _process_session(
     session_beg = datetime.fromtimestamp(beg_ts, tz=_UTC8).isoformat() if beg_ts else ""
     session_end = datetime.fromtimestamp(end_ts, tz=_UTC8).isoformat() if end_ts else ""
     write_text = _build_write_prompt()
-    p2, p2_err = _run_phase2(sid, write_text)
+    p2, p2_err = _run_phase2(sid, write_text, drop_extra=drop_n or 0)
 
     if p2 is None or not p2["content"]:
         _log(f"phase2 failed or empty content")
