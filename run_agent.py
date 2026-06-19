@@ -2266,6 +2266,16 @@ class AIAgent:
             original_send = client._client.send
 
             def _send(request, **kw):
+                if self._capture_seq == 0:
+                    max_seq = 0
+                    for f in self._capture_dir.glob("*_req.json"):
+                        try:
+                            seq = int(f.stem.split("_")[0])
+                            if seq > max_seq:
+                                max_seq = seq
+                        except (ValueError, IndexError):
+                            pass
+                    self._capture_seq = max_seq
                 self._capture_seq += 1
                 try:
                     return original_send(request, **kw)
