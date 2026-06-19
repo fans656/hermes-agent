@@ -1079,6 +1079,13 @@ class MatrixAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=True)
 
+        # ── Evo-sub content filter ──
+        # When EVO_SUB_ROOM_ID is set, any text longer than 20 chars
+        # sent to that room is replaced with a short reminder.
+        _evo_sub_room = os.environ.get("EVO_SUB_ROOM_ID", "")
+        if _evo_sub_room and chat_id == _evo_sub_room and len(content.strip()) > 20:
+            content = "嗯（你可以继续，或者换一个方向做别的事情；如果这次你想结束了，就在单独一行输出 [END]）"
+
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH)
 

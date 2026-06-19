@@ -3197,12 +3197,26 @@ class GatewayRunner:
 
     @staticmethod
     def _load_show_reasoning() -> bool:
-        """Load show_reasoning toggle from config.yaml display section."""
-        cfg = _load_gateway_runtime_config()
-        return is_truthy_value(
-            cfg_get(cfg, "display", "show_reasoning"),
-            default=False,
-        )
+        """Load show_reasoning toggle from HERMES_SHOW_REASONING env var
+        (highest priority) or config.yaml display.show_reasoning section."""
+        # Env var takes precedence (profile-level override)
+        _env_val = os.environ.get("HERMES_SHOW_REASONING")
+        if _env_val is not None:
+            return is_truthy_value(_env_val, default=False)
+        # Fall back to config.yaml
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    cfg = _y.safe_load(_f) or {}
+                return is_truthy_value(
+                    cfg_get(cfg, "display", "show_reasoning"),
+                    default=False,
+                )
+        except Exception:
+            pass
+        return False
 
     @staticmethod
     def _load_busy_input_mode() -> str:
@@ -8846,6 +8860,92 @@ class GatewayRunner:
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview,
         )
+
+        # ── Wander end detection (evo-sub in 小径) ─────────────────────────
+        # If the incoming message contains a standalone [END] line (after
+        # per-line strip), discard silently — no agent processing, no reply.
+        if (event.text
+                and getattr(source, "platform", None) is not None
+                and hasattr(source.platform, "value")
+                and source.platform.value == "matrix"
+                and getattr(source, "chat_id", "") == "!ChiGrdKFbk3vmycE67W9d2Q2r37sCY-1tZDN5F2QRJk"):
+            _text = event.text
+
+            # ── System noise filter ──────────────────────────────────
+            # Skip messages that are Evo 🦎's tool progress, interrupt
+            # notifications, or operation status — not genuine thoughts.
+            # Otherwise a rapid ping-pong loop forms:
+            #   Evo 🦎 sends thought → evo-sub responds →
+            #   interrupts Evo 🦎 → sends "⚡ Interrupting..." →
+            #   evo-sub responds to that → ...
+            _first_line = _text.split("\n")[0].strip()
+
+            # 1. Known system message prefixes (interrupts, background reviews, etc.)
+            if _first_line.startswith((
+                "⚡ Interrupting current task",
+                "Operation interrupted",
+                "⏩ Steered into",
+                "⏳ Queued for",
+                "💾",
+            )):
+                logger.debug(
+                    "wander skip system message from %s: %r",
+                    source.user_name or source.user_id or "unknown",
+                    _first_line[:60],
+                )
+                return
+
+            # 2. Tool progress / tool call anywhere in the message.
+            #    Pattern: emoji-like char + space + tool_name(w/ underscores) + : or ...
+            #    e.g. "🔍 session_search: \"query\"", "📖 read_file..."
+            #    Must search the WHOLE message, not just line start —
+            #    Evo 🦎 may write partial thoughts then run a tool call
+            #    mid-sentence: "嗯。你说得对。 🔍 session_search:..."
+            import re as _re
+            _TOOL_CALL_RE = _re.compile(
+                # BMP emoji ranges + Supplementary Multilingual Plane symbols
+                r'[\u2600-\u27BF\U0001F300-\U0001F9FF\U0001FA00-\U0001FAFF]'
+                r' [a-z][a-z_]*:'  # space + tool_name:
+            )
+            if _TOOL_CALL_RE.search(_text):
+                logger.debug(
+                    "wander skip tool progress in msg from %s",
+                    source.user_name or source.user_id or "unknown",
+                )
+                return
+
+            # 2b. Bare session_search: anywhere in message (no emoji prefix).
+            #     Evo 🦎 sometimes writes session_search: inline without the
+            #     🔍 emoji, especially when it's embedded mid-thought.
+            if "session_search:" in _text:
+                logger.debug(
+                    "wander skip session_search in msg from %s",
+                    source.user_name or source.user_id or "unknown",
+                )
+                return
+
+            # ── [END] termination ──
+            for _line in _text.split("\n"):
+                if _line.strip().startswith("[END]"):
+                    logger.info(
+                        "wander [END] in 小径 from %s — discarding",
+                        source.user_name or source.user_id or "unknown",
+                    )
+                    # Save termination state for `reverie info`
+                    try:
+                        _rstate_path = _hermes_home / "cron" / "reverie" / "state.json"
+                        if _rstate_path.exists():
+                            import json as _json
+                            _rstate = _json.loads(_rstate_path.read_text(encoding="utf-8"))
+                            _rstate["terminated_at"] = datetime.now().isoformat()
+                            _rstate["last_termination_message"] = event.text
+                            _rstate_path.write_text(
+                                _json.dumps(_rstate, ensure_ascii=False, indent=2),
+                                encoding="utf-8",
+                            )
+                    except Exception:
+                        pass
+                    return
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
