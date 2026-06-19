@@ -12781,6 +12781,8 @@ class GatewayRunner:
                     thread_id=source.thread_id,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    skip_memory=is_truthy_value(os.environ.get("HERMES_SKIP_MEMORY")),
+                    skip_context_files=is_truthy_value(os.environ.get("HERMES_SKIP_CONTEXT_FILES")),
                 )
                 try:
                     return agent.run_conversation(
@@ -18003,6 +18005,8 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
+                    skip_memory=is_truthy_value(os.environ.get("HERMES_SKIP_MEMORY")),
+                    skip_context_files=is_truthy_value(os.environ.get("HERMES_SKIP_CONTEXT_FILES")),
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
