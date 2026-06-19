@@ -1339,6 +1339,9 @@ def run_conversation(
                 
                 api_duration = time.time() - api_start_time
                 
+                if agent._capture_raw and agent._capture_seq:
+                    agent._capture_raw_resp(response, agent._capture_seq)
+                
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
                 if thinking_spinner:

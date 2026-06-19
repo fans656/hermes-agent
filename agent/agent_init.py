@@ -973,6 +973,17 @@ def init_agent(
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
 
+    if agent._capture_raw:
+        capture_dir = (
+            get_hermes_home() / "sessions" / "cache" / "captured"
+            / agent.session_id
+        )
+        try:
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            agent._capture_dir = capture_dir
+        except Exception:
+            pass
+
     # Expose session ID to tools (terminal, execute_code) so agents can
     # reference their own session for --resume commands, cross-session
     # coordination, and logging. Keep the ContextVar and os.environ
