@@ -991,6 +991,14 @@ Use `get_hermes_home()` from `hermes_constants` for code paths. Use `display_her
 for user-facing print/log messages. Hardcoding `~/.hermes` breaks profiles — each profile
 has its own `HERMES_HOME` directory. This was the source of 5 bugs fixed in PR #3575.
 
+### DO NOT silently swallow exceptions
+`except Exception: pass` or `except Exception: return default` without any logging
+makes failures invisible, especially when the code runs as a subprocess or cron job.
+Always log the exception + traceback to stderr or a logger before returning a fallback.
+The only acceptable reason to silently swallow is when the exception is *expected* (e.g.
+trying an optional import, checking a cache that may not exist).  When in doubt, log it.
+See `fans656_scripts/session.py` for the canonical pattern.
+
 ### DO NOT introduce new `simple_term_menu` usage
 Existing call sites in `hermes_cli/main.py` remain for legacy fallback only;
 the preferred UI is curses (stdlib) because `simple_term_menu` has
