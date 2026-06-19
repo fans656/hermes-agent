@@ -1215,6 +1215,8 @@ def init_agent(
     # targets.
     agent._task_completion_guidance = bool(_agent_section.get("task_completion_guidance", True))
 
+    agent._hermes_help_guidance = bool(_agent_section.get("hermes_help_guidance", True))
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics

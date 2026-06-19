@@ -844,6 +844,11 @@ DEFAULT_CONFIG = {
         # plausible-looking output when a real path is blocked.  Costs ~80
         # tokens in the cached system prompt.  Set False to disable globally.
         "task_completion_guidance": True,
+        # Hermes-agent help guidance — tells the model where to find Hermes
+        # docs and the hermes-agent skill when the user asks about Hermes
+        # itself.  Costs ~50 tokens in the cached system prompt.
+        # Set False to disable.
+        "hermes_help_guidance": True,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP
