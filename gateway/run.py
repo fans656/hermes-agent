@@ -19586,6 +19586,53 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     logger.info("Cron ticker stopped")
 
 
+def _write_tools_snapshot() -> None:
+    """Write a per-platform tool snapshot to ``~/.hermes/.tools_snapshot.json``.
+
+    Called once at gateway startup so external frontends can discover
+    available tools without shelling out to the TUI gateway JSON-RPC.
+    """
+    try:
+        from hermes_cli.config import load_config as _load_usr_cfg
+        from hermes_cli.tools_config import _get_platform_tools
+        from model_tools import get_tool_definitions
+    except ImportError:
+        return
+
+    tools_by_platform = {}
+    _config = _load_usr_cfg() or {}
+    _platform_toolsets = _config.get("platform_toolsets") or {}
+
+    for platform_key in _platform_toolsets:
+        try:
+            enabled_ts = sorted(_get_platform_tools(_config, platform_key))
+            defs = get_tool_definitions(enabled_toolsets=enabled_ts, quiet_mode=True)
+            tools_by_platform[platform_key] = {
+                "toolsets": enabled_ts,
+                "tools": [
+                    {
+                        "name": t["function"]["name"],
+                        "description": t["function"]["description"],
+                        "parameters": t["function"]["parameters"],
+                    }
+                    for t in defs
+                ],
+            }
+        except Exception as e:
+            logger.debug("Tool snapshot for %s skipped: %s", platform_key, e)
+
+    if tools_by_platform:
+        import json
+        from hermes_constants import get_hermes_home
+        _path = get_hermes_home() / ".tools_snapshot.json"
+        _path.write_text(
+            json.dumps({"version": 1, "platforms": tools_by_platform},
+                       indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info("Wrote tool snapshot: %s (%d platforms)", _path, len(tools_by_platform))
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -19933,6 +19980,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         await _loop.run_in_executor(None, discover_mcp_tools)
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
+
+    # Write tool snapshot so external frontends can discover available tools
+    # without connecting to the TUI gateway JSON-RPC.  Must run after MCP
+    # discovery (so externally-supplied tools are registered) but before
+    # gateway start (so the snapshot is ready when a frontend queries it).
+    _write_tools_snapshot()
 
     # Start the gateway
     success = await runner.start()
