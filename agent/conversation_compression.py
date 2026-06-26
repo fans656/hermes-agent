@@ -501,6 +501,13 @@ def compress_context(
     # Commit the original full messages BEFORE compression replaces them.
     # This is the last safety net — if anything below fails, the raw
     # conversation is already durable in state.db.
+
+    _sdb_value = getattr(agent, "_session_db", None)
+    _has_sdb = hasattr(agent, "_session_db") and bool(agent._session_db)
+    logger.info(
+        "Compression split check: has_session_db=%s session=%s",
+        _has_sdb, agent.session_id,
+    )
     if agent._session_db:
         try:
             agent.commit_memory_session(messages)
