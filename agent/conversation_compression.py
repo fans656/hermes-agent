@@ -498,12 +498,24 @@ def compress_context(
     new_system_prompt = agent._build_system_prompt(system_message)
     agent._cached_system_prompt = new_system_prompt
 
+    # Commit the original full messages BEFORE compression replaces them.
+    # This is the last safety net — if anything below fails, the raw
+    # conversation is already durable in state.db.
     if agent._session_db:
+        try:
+            agent.commit_memory_session(messages)
+        except Exception as e:
+            logger.warning(
+                "Failed to commit messages before compression (session=%s): %s",
+                agent.session_id, e,
+            )
+
+    compression_has_session_db = bool(agent._session_db)
+    split_succeeded = False
+    if compression_has_session_db:
         try:
             # Propagate title to the new session with auto-numbering
             old_title = agent._session_db.get_session_title(agent.session_id)
-            # Trigger memory extraction on the old session before it rotates.
-            agent.commit_memory_session(messages)
             agent._session_db.end_session(agent.session_id, "compression")
             old_session_id = agent.session_id
             agent.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
@@ -532,8 +544,42 @@ def compress_context(
             agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
             # Reset flush cursor — new session starts with no messages written
             agent._last_flushed_db_idx = 0
+            split_succeeded = True
         except Exception as e:
             logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+    else:
+        logger.warning(
+            "Compression proceeding without session DB (session=%s) — "
+            "compacted messages will replace original conversation in-place. "
+            "Raw messages were committed above if possible; check state.db.",
+            agent.session_id,
+        )
+
+    # ── Abort if session split failed and config demands durability ─────
+    # When compression.abort_on_split_failure is True, a failed session
+    # split means the compressed summary would overwrite original messages
+    # in-place without creating a restorable parent session.  In that case,
+    # return the uncompressed messages so the conversation continues with
+    # full history intact (at the cost of hitting context limits sooner).
+    if not split_succeeded and compression_has_session_db:
+        abort_on_split_failure = False
+        try:
+            _cc = getattr(agent, "context_compressor", None)
+            if _cc is not None:
+                abort_on_split_failure = getattr(_cc, "abort_on_split_failure", False)
+        except Exception:
+            pass
+        if abort_on_split_failure:
+            logger.warning(
+                "Compression aborted: session split failed and "
+                "compression.abort_on_split_failure=true (session=%s)",
+                agent.session_id,
+            )
+            _existing_sp = getattr(agent, "_cached_system_prompt", None)
+            if not _existing_sp:
+                _existing_sp = agent._build_system_prompt(system_message)
+            _release_lock()
+            return messages, _existing_sp
 
     # Notify the context engine that the session_id rotated because of
     # compression (not a fresh /new). Plugin engines (e.g. hermes-lcm) use

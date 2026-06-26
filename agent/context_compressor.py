@@ -596,6 +596,7 @@ class ContextCompressor(ContextEngine):
         provider: str = "",
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
+        abort_on_split_failure: bool = False,
     ):
         self.model = model
         self.base_url = base_url
@@ -612,6 +613,10 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+        # When True, a failed session-DB split during compression aborts the
+        # entire compression rather than continuing with compacted messages
+        # that overwrite the originals in-place without lineage preservation.
+        self.abort_on_split_failure = abort_on_split_failure
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,

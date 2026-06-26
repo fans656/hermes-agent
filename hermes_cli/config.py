@@ -1144,6 +1144,14 @@ DEFAULT_CONFIG = {
                                       # Default False matches historical behavior; set to
                                       # True if you'd rather pause than silently lose
                                       # context turns when your aux model is flaky.
+        "abort_on_split_failure": False,  # When True, auto-compression that succeeds at
+                                      # generating a summary but fails to create a new
+                                      # session (e.g. session DB is unavailable) aborts
+                                      # entirely instead of silently replacing messages
+                                      # in-place without lineage preservation.  Default
+                                      # False matches historical behavior; set to True to
+                                      # prevent losing original conversation history when
+                                      # session splitting is broken.
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
