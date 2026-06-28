@@ -1530,6 +1530,13 @@ class AIAgent:
         truly new messages — preventing the duplicate-write bug (#860).
         """
         if not self._session_db:
+            # Log once per session to avoid spamming the log on every turn.
+            if not getattr(self, "_warned_missing_session_db", False):
+                self._warned_missing_session_db = True
+                logger.warning(
+                    "Session DB not available — conversation messages will NOT be "
+                    "persisted. session=%s", self.session_id or "unknown",
+                )
             return
         self._apply_persist_user_message_override(messages)
         try:
@@ -1538,6 +1545,18 @@ class AIAgent:
                 self._ensure_db_session()
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
+            # Defensive: if the message list is shorter than the flush cursor
+            # (e.g. after in-place compression without session split), the
+            # cursor is stale and would silently skip new messages.  Reset it.
+            if flush_from >= len(messages):
+                logger.warning(
+                    "flush cursor (%d/%d) is past end of message list for session=%s "
+                    "— likely a compression without session split. Resetting cursor "
+                    "so new messages are not silently skipped.",
+                    flush_from, len(messages), self.session_id or "?",
+                )
+                self._last_flushed_db_idx = max(0, start_idx)
+                flush_from = self._last_flushed_db_idx
             for msg in messages[flush_from:]:
                 role = msg.get("role", "unknown")
                 content = msg.get("content")

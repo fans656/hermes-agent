@@ -1435,7 +1435,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         from hermes_state import SessionDB
         _session_db = SessionDB()
     except Exception as e:
-        logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
+        logger.warning("Job '%s': SQLite session store not available — messages will NOT be persisted: %s", job.get("id", "?"), e)
 
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit

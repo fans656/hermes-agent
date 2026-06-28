@@ -3839,6 +3839,25 @@ class GatewayRunner:
 
     def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
         for agent in active_agents.values():
+            # Best-effort SQLite flush before tearing the agent down.
+            # When drain times out, the agent was mid-turn and _persist_session
+            # may not have run.  This catches any messages still in memory.
+            if hasattr(agent, "_session_messages") and hasattr(agent, "_session_db"):
+                try:
+                    agent._flush_messages_to_session_db(
+                        agent._session_messages,
+                        getattr(agent, "_conversation_history", None),
+                    )
+                    logger.info(
+                        "Shutdown: flushed %d messages for session %s",
+                        len(agent._session_messages),
+                        getattr(agent, "session_id", "?"),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Shutdown flush failed for session %s: %s",
+                        getattr(agent, "session_id", "?"), e,
+                    )
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
                 _invoke_hook(
