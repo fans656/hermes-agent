@@ -830,6 +830,47 @@ def _clear_planned_restart_notification() -> None:
     _planned_restart_notification_path().unlink(missing_ok=True)
 
 
+def _build_restart_config_summary() -> str:
+    """Build a human-readable config summary for the restart notification."""
+    try:
+        from gateway.run import _load_gateway_config as _load_gw_cfg
+        config = _load_gw_cfg()
+    except Exception:
+        config = {}
+
+    model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+    comp_cfg = config.get("compression", {}) if isinstance(config, dict) else {}
+
+    model = model_cfg.get("default") or model_cfg.get("model") or "?"
+    ctx = model_cfg.get("context_length")
+    ctx_str = f"{ctx:,}" if isinstance(ctx, int) and ctx > 0 else "auto"
+
+    comp_enabled = comp_cfg.get("enabled", True)
+    comp_threshold = comp_cfg.get("threshold", 0.5)
+    comp_abort = comp_cfg.get("abort_on_split_failure", False)
+
+    if comp_enabled == "warn":
+        comp_mode = "warn-only"
+    elif comp_enabled in (True, "true", 1, "yes", "1"):
+        comp_mode = "auto"
+    else:
+        comp_mode = "off"
+
+    warn_at = int(float(comp_threshold) * (ctx if isinstance(ctx, int) else 256000))
+
+    lines = [
+        "♻ Gateway restarted. Config:",
+        f"  model: {model}",
+        f"  context: {ctx_str} tokens",
+        f"  compression: {comp_mode}",
+    ]
+    if comp_mode != "off":
+        lines.append(f"  threshold: {float(comp_threshold):.0%} (warn at ~{warn_at:,} tokens)")
+        if comp_abort:
+            lines.append("  abort_on_split_failure: true")
+    return "\n".join(lines)
+
+
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
 # knows not to clobber TERMINAL_CWD if lazily imported.
 os.environ["_HERMES_GATEWAY"] = "1"
@@ -15634,7 +15675,7 @@ class GatewayRunner:
             )
             result = await adapter.send(
                 str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
+                _build_restart_config_summary(),
                 metadata=metadata,
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
