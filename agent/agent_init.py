@@ -1247,7 +1247,9 @@ def init_agent(
             compression_threshold = _model_cthresh
     except Exception:
         pass
-    compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
+    compression_enabled_raw = str(_compression_cfg.get("enabled", True)).lower()
+    compression_enabled = compression_enabled_raw in {"true", "1", "yes"}
+    compression_warn_only = compression_enabled_raw == "warn"
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # protect_first_n is the number of non-system messages to protect at
@@ -1485,6 +1487,7 @@ def init_agent(
             abort_on_split_failure=compression_abort_on_split_failure,
         )
     agent.compression_enabled = compression_enabled
+    agent.compression_warn_only = compression_warn_only
 
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).

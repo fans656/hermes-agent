@@ -1122,7 +1122,9 @@ DEFAULT_CONFIG = {
     },
 
     "compression": {
-        "enabled": True,
+        "enabled": True,               # True/1/yes → auto-compress at threshold
+                                       # warn → warn at threshold, don't compress
+                                       # False/0/no → no compress, no warning
         "threshold": 0.50,            # compress when context usage exceeds this ratio
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
