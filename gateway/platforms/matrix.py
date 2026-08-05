@@ -2740,8 +2740,17 @@ class MatrixAdapter(BasePlatformAdapter):
             return True
         if self._user_id and ":" in self._user_id:
             localpart = self._user_id.split(":")[0].lstrip("@")
+            # Match only an EXPLICIT `@localpart` mention, NOT a bare word.
+            # (fork patch 2026-08-05) Previously this matched the bare localpart
+            # anywhere in the body (\blocalpart\b, case-insensitive), so ordinary
+            # prose that merely NAMES the bot — "Evo, ..." addressed to @evo —
+            # was treated as an @mention. That silently defeated require_mention /
+            # thread_require_mention (every message naming the bot "mentioned" it
+            # → forced reply → multi-agent storms). This mirrors the sibling fix
+            # 32b78578e0 which already made _strip_mention strip only explicit
+            # @mentions, not bare words; the detect side was left inconsistent.
             if localpart and re.search(
-                r"\b" + re.escape(localpart) + r"\b", body, re.IGNORECASE
+                r"(?<![\w])@" + re.escape(localpart) + r"\b", body, re.IGNORECASE
             ):
                 return True
         if formatted_body and self._user_id:
