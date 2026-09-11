@@ -132,7 +132,11 @@ _DEEPSEEK_CANONICAL_MODELS: frozenset[str] = frozenset({
     "deepseek-chat",       # V3 on DeepSeek direct and most aggregators
     "deepseek-reasoner",   # R1-family reasoning model
     "deepseek-v4-pro",     # V4 Pro — first-class model ID
-    "deepseek-v4-flash",   # V4 Flash — first-class model ID
+    "deepseek-v4-flash",   # V4 Flash — first-class model ID (retired 2026-09; alias kept)
+    "deepseek-flash",      # V4.1-Flash — current first-class ID (2026-09). It has no
+                           # "v<digit>", so _DEEPSEEK_V_SERIES_RE below does NOT match it;
+                           # without this entry it folded to deepseek-chat (V3), which
+                           # silently dropped reasoning + vision.
 })
 
 # First-class V-series IDs (``deepseek-v4-pro``, ``deepseek-v4-flash``,
@@ -149,7 +153,7 @@ def _normalize_for_deepseek(model_name: str) -> str:
 
     Rules:
     - Already a known canonical (``deepseek-chat``/``deepseek-reasoner``/
-      ``deepseek-v4-pro``/``deepseek-v4-flash``) -> pass through.
+      ``deepseek-v4-pro``/``deepseek-v4-flash``/``deepseek-flash``) -> pass through.
     - Matches the V-series pattern ``deepseek-v<digit>...`` -> pass through
       (covers future ``deepseek-v5-*`` and dated variants without a release).
     - Contains a reasoner keyword (r1, think, reasoning, cot, reasoner)

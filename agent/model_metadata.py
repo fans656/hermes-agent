@@ -189,6 +189,9 @@ DEFAULT_CONTEXT_LENGTHS = {
     # https://api-docs.deepseek.com/zh-cn/quick_start/pricing
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
+    "deepseek-flash": 1_000_000,      # V4.1-Flash (2026-09 first-class ID). Without
+                                      # this entry the longest-substring fallback lands
+                                      # on the 128K "deepseek" catch-all below.
     "deepseek-chat": 1_000_000,
     "deepseek-reasoner": 1_000_000,
     "deepseek": 128000,

@@ -29,12 +29,19 @@ def _model_supports_thinking(model: str | None) -> bool:
     """DeepSeek thinking-capable model families.
 
     Currently covers the V4 family (``deepseek-v4-pro``, ``deepseek-v4-flash``,
-    and any future ``deepseek-v4-*`` variants) and the legacy
+    and any future ``deepseek-v4-*`` variants), V4.1-Flash (``deepseek-flash``,
+    the 2026-09 first-class ID that replaced V4-Flash), and the legacy
     ``deepseek-reasoner`` (R1).  ``deepseek-chat`` is V3 with no thinking mode.
     """
     m = (model or "").strip().lower()
     if not m:
         return False
+    if m == "deepseek-flash":
+        # V4.1-Flash — 2026-09 first-class ID. Has no "v<digit>", so the prefix
+        # check below misses it; it is a thinking-mode model like the V4 family.
+        # Missing here meant requests went out without extra_body.thinking,
+        # so the API returned no reasoning_content at all.
+        return True
     if m.startswith("deepseek-v") and not m.startswith("deepseek-v3"):
         # deepseek-v4-*, deepseek-v5-*, etc. — every V4+ generation has
         # thinking. v3 explicitly excluded.

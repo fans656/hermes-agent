@@ -114,8 +114,10 @@ class TestDeepSeekModelGating:
             "deepseek-v4-pro",
             "deepseek-v4-flash",
             "deepseek-v4-future-variant",
+            "deepseek-flash",  # V4.1-Flash (2026-09 first-class ID, replaced V4-Flash)
             "deepseek-reasoner",
             "DEEPSEEK-V4-PRO",  # case-insensitive
+            "DEEPSEEK-FLASH",   # V4.1 case-insensitive
         ],
     )
     def test_thinking_capable_models_emit_thinking(self, deepseek_profile, model):

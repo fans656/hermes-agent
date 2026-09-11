@@ -228,6 +228,18 @@ class TestDeepseekVSeriesPassThrough:
         result = normalize_model_for_provider("deepseek-v4-flash", "deepseek")
         assert result == "deepseek-v4-flash"
 
+    def test_deepseek_flash_first_class_id_not_folded(self):
+        """``deepseek-flash`` (V4.1-Flash, the 2026-09 ID that replaced
+        V4-Flash) has no ``v<digit>``, so the V-series regex misses it. Without
+        an explicit canonical entry it folded to ``deepseek-chat`` (V3) — which
+        silently dropped ``reasoning_content`` (V3 has no thinking mode) and the
+        native vision the V4.1 model ships with. Regression pin.
+        """
+        assert _normalize_for_deepseek("deepseek-flash") == "deepseek-flash"
+        assert _normalize_for_deepseek("deepseek/deepseek-flash") == "deepseek-flash"
+        assert _normalize_for_deepseek("DeepSeek-Flash") == "deepseek-flash"
+        assert normalize_model_for_provider("deepseek-flash", "deepseek") == "deepseek-flash"
+
 
 # ── DeepSeek regressions (existing behaviour still holds) ──────────────
 
