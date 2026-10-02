@@ -41,6 +41,7 @@ _ISO_FMT = "%Y-%m-%dT%H:%M:%S%z"
 _COOLDOWN_HOURS = int(os.getenv("PROACTIVE_DIARY_COOLDOWN_HOURS", "2"))
 _COOLDOWN_ENABLED = False  # temporarily disabled for cron; flip to True to enable
 _ACTIVE_CHECK_THRESHOLD = 600  # 10min — session still hot if last msg within this
+_STALE_THRESHOLD = int(os.getenv("PROACTIVE_DIARY_STALE_HOURS", "48")) * 3600  # too old to backfill
 
 PROBE_TEXT = (
     "[SYSTEM NOTE]\n"
@@ -505,6 +506,16 @@ def _process_session(
     # ── Active conversation check: skip if session still warm ───────────
     if not force and msg_ts and (now - msg_ts) < _ACTIVE_CHECK_THRESHOLD:
         _log(f"  skip: session warm ({_humanize_gap(now - msg_ts)} since last msg)")
+        return
+
+    # ── Stale check: never backfill a diary for a long-idle session ─────
+    # A diary entry is meant to be written close to the conversation it
+    # describes. Sessions whose last real message is older than this window
+    # (default 48h) are skipped — otherwise a session that keeps resurfacing
+    # in the last-msg ordering (e.g. messages backfilled out of order) would
+    # get an entry written days later, with a beg/end timestamp from long ago.
+    if not force and msg_ts and (now - msg_ts) > _STALE_THRESHOLD:
+        _log(f"  skip: session stale ({_humanize_gap(now - msg_ts)} last msg)")
         return
 
     # ── Still processing: last message is user, wait for assistant ──────

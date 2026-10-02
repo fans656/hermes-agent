@@ -223,7 +223,15 @@ def list_sessions(
 
         order_clause = "ORDER BY s.started_at DESC"
         if sort_by == "last-msg":
-            order_clause = "ORDER BY max_message_id DESC"
+            # Order by the newest message TIMESTAMP, not by messages.id: ids are
+            # assigned in insert order, so backfilled/imported messages (old
+            # content written to the DB late) get large ids and masquerade as
+            # recently-active sessions. That made the diary cron pick up
+            # month-old sessions and write diary entries for them.
+            order_clause = (
+                "ORDER BY COALESCE((SELECT MAX(m.timestamp) FROM messages m "
+                "WHERE m.session_id = s.id), s.started_at) DESC"
+            )
 
         if limit <= 0:
             limit_clause = ""
